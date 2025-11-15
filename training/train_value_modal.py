@@ -1,5 +1,11 @@
 """
-Value Model Training on Modal (Serverless GPU)
+Value Model Training on Modal (Serverless GPU) - v3.0
+
+IMPROVEMENTS:
+- ✅ Huber loss (robust to extreme mate scores)
+- ✅ Clipped evaluations (±5000 cp max)
+- ✅ Weight decay regularization
+- ✅ 18-channel input (proper castling encoding)
 
 Trains chess value model on Modal's cloud GPUs with:
 - Automatic checkpoint saving/resuming
@@ -16,8 +22,8 @@ Usage Examples:
     # Test run (5 min, ~$0.10)
     modal run train_value_modal.py::main --epochs 2 --max-samples 10000
 
-    # Initial training (1 hr, ~$1.10)
-    modal run train_value_modal.py::main --epochs 10 --max-samples 100000
+    # Recommended: Large dataset, few epochs
+    modal run train_value_modal.py::main --epochs 5 --max-samples 2000000
 
     # Resume training
     modal run train_value_modal.py::main --resume --epochs 20
@@ -31,7 +37,7 @@ Usage Examples:
 Cost with A10G GPU (~$1.10/hr):
     - 10k samples, 2 epochs: ~5 min = $0.10
     - 100k samples, 10 epochs: ~1 hr = $1.10
-    - 1M samples, 10 epochs: ~10 hr = $11
+    - 2M samples, 5 epochs: ~10 hr = $11
 
 Note: No .env file or secrets needed - Modal handles authentication automatically
 """
@@ -255,9 +261,11 @@ def train_on_modal(
             eval_str = eval_str.strip()
             
             if '#' in eval_str:
-                # Mate score
+                # Mate score - clip to reasonable range to prevent extreme values
                 mate_in = int(eval_str.replace('#', '').replace('+', '').replace('-', ''))
-                mate_score = 10000 - abs(mate_in) * 10
+                # Clip mate scores to ±5000 (50 pawns) to reduce skew
+                # Still clearly winning, but not so large it dominates loss
+                mate_score = min(5000 - abs(mate_in) * 10, 5000)
                 if '+' in eval_str or (eval_str.startswith('#') and '-' not in eval_str):
                     eval_white = mate_score
                 else:
@@ -265,6 +273,8 @@ def train_on_modal(
             else:
                 try:
                     eval_white = float(eval_str)
+                    # Also clip extreme non-mate evaluations (rare but possible)
+                    eval_white = max(-5000, min(5000, eval_white))
                 except Exception:
                     eval_white = 0.0
             
@@ -395,8 +405,14 @@ def train_on_modal(
     model = ValueModel(channels=channels, num_blocks=num_blocks).to(device)
     print(f"✓ Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # Use Huber loss instead of MSE - better for chess with extreme mate scores
+    # Delta=100 means errors below 100cp are treated as L2, above as L1
+    criterion = nn.HuberLoss(delta=100.0)
+    print(f"✓ Using Huber loss (delta=100 cp) - robust to mate score outliers")
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    print(f"✓ Adam optimizer with weight decay (prevents overfitting)")
+    
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=2, verbose=True
     )
@@ -432,7 +448,7 @@ def train_on_modal(
             )
             samples_trained += epoch_samples
             metrics['train_losses'].append(train_loss)
-            print(f"✓ Train Loss: {train_loss:.2f} cp²")
+            print(f"✓ Train Loss: {train_loss:.2f} (Huber)")
             print(f"✓ Total samples trained: {samples_trained:,}")
         except Exception as e:
             print(f"✗ Training error: {e}")
@@ -442,7 +458,7 @@ def train_on_modal(
         try:
             test_loss = evaluate(model, test_loader, criterion, device)
             metrics['test_losses'].append(test_loss)
-            print(f"✓ Test Loss: {test_loss:.2f} cp²")
+            print(f"✓ Test Loss: {test_loss:.2f} (Huber)")
         except Exception as e:
             print(f"✗ Evaluation error: {e}")
             raise
@@ -460,7 +476,7 @@ def train_on_modal(
             metrics['best_test_loss'] = test_loss
             best_model_path = checkpoint_dir / "value_model_best.pth"
             torch.save(model.state_dict(), best_model_path)
-            print(f"🏆 New best model! Test loss: {test_loss:.2f} cp²")
+            print(f"🏆 New best model! Test loss: {test_loss:.2f} (Huber)")
         
         # Commit volume changes
         volume.commit()
@@ -494,7 +510,7 @@ def train_on_modal(
     print("✅ TRAINING COMPLETE")
     print("=" * 70)
     print(f"📊 Total samples trained: {samples_trained:,}")
-    print(f"🏆 Best test loss: {metrics['best_test_loss']:.2f} cp²")
+    print(f"🏆 Best test loss: {metrics['best_test_loss']:.2f} (Huber)")
     print(f"💾 Best model: {best_model_path.name}")
     print(f"💾 Final model: {final_model_path.name}")
     print(f"📄 Summary: {summary_path.name}")
@@ -557,8 +573,8 @@ def main(
     print("\n✅ Training complete!")
     print("\n📊 Training Summary:")
     print(f"  • Samples trained: {summary['total_samples_trained']:,}")
-    print(f"  • Best test loss: {summary['best_test_loss']:.2f} cp²")
-    print(f"  • Final test loss: {summary['final_test_loss']:.2f} cp²")
+    print(f"  • Best test loss: {summary['best_test_loss']:.2f} (Huber)")
+    print(f"  • Final test loss: {summary['final_test_loss']:.2f} (Huber)")
     print("\n📦 Models saved to Modal volume 'chess-models'")
     print("\n📥 To download trained model:")
     print("  modal run train_value_modal.py::download")
