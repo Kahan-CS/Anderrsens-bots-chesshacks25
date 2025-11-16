@@ -205,52 +205,52 @@ for i, piece in enumerate(PROMO_PIECES):
         plane = 64 + (dx + 1) * 3 + i
         UNDER_PROMO_MAP[(dx, piece)] = plane
 
-    def move_to_index(move: chess.Move, board: chess.Board = None) -> int:
-        """
-        Converts a chess.Move object to the 4672-logit (8*8*73) index
-        used by AlphaZero-style policy networks.
+def move_to_index(move: chess.Move, board: chess.Board = None) -> int:
+    """
+    Converts a chess.Move object to the 4672-logit (8*8*73) index
+    used by AlphaZero-style policy networks.
 
-        Indexing scheme (73 planes per 'from' square):
-        - 0-55: Queen-like moves (8 directions, 7 squares each)
-        - 56-63: Knight moves (8 directions)
-        - 64-72: Under-promotions (3 directions [L, F, R] x 3 pieces [N, B, R])
-                (Queen promotions are encoded as queen-like moves)
-        """
-        from_sq = move.from_square
-        to_sq = move.to_square
+    Indexing scheme (73 planes per 'from' square):
+    - 0-55: Queen-like moves (8 directions, 7 squares each)
+    - 56-63: Knight moves (8 directions)
+    - 64-72: Under-promotions (3 directions [L, F, R] x 3 pieces [N, B, R])
+            (Queen promotions are encoded as queen-like moves)
+    """
+    from_sq = move.from_square
+    to_sq = move.to_square
 
-        fx = chess.square_file(from_sq)
-        fy = chess.square_rank(from_sq)
-        tx = chess.square_file(to_sq)
-        ty = chess.square_rank(to_sq)
+    fx = chess.square_file(from_sq)
+    fy = chess.square_rank(from_sq)
+    tx = chess.square_file(to_sq)
+    ty = chess.square_rank(to_sq)
 
-        dx = tx - fx
-        dy = ty - fy
-        
-        # Base index for the 'from' square (0, 73, 146, ...)
-        base_idx = from_sq * 73
+    dx = tx - fx
+    dy = ty - fy
+    
+    # Base index for the 'from' square (0, 73, 146, ...)
+    base_idx = from_sq * 73
 
-        # Case 1: Under-promotions (N, B, R)
-        if move.promotion in PROMO_PIECES:
-            plane = UNDER_PROMO_MAP.get((dx, move.promotion))
-            if plane is not None:
-                return base_idx + plane
-
-        # Case 2: Knight moves
-        plane = KNIGHT_MAP.get((dy, dx))
+    # Case 1: Under-promotions (N, B, R)
+    if move.promotion in PROMO_PIECES:
+        plane = UNDER_PROMO_MAP.get((dx, move.promotion))
         if plane is not None:
             return base_idx + plane
 
-        # Case 3: Queen-like moves (incl. King, Pawn, Rook, Bishop, Queen)
-        # This also handles Queen promotions (as 1-square pushes)
-        # and Castling (as 2-square king moves).
-        plane = QUEEN_MAP.get((dy, dx))
-        if plane is not None:
-            return base_idx + plane
+    # Case 2: Knight moves
+    plane = KNIGHT_MAP.get((dy, dx))
+    if plane is not None:
+        return base_idx + plane
 
-        # Should be unreachable for any legal move
-        # Fallback to the '0' bucket for this square
-        return base_idx
+    # Case 3: Queen-like moves (incl. King, Pawn, Rook, Bishop, Queen)
+    # This also handles Queen promotions (as 1-square pushes)
+    # and Castling (as 2-square king moves).
+    plane = QUEEN_MAP.get((dy, dx))
+    if plane is not None:
+        return base_idx + plane
+
+    # Should be unreachable for any legal move
+    # Fallback to the '0' bucket for this square
+    return base_idx
 # ============================================================================
 # POLICY MODEL
 # ============================================================================
