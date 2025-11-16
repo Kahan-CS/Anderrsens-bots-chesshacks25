@@ -19,8 +19,10 @@ class CombinedEngine:
             policy_fn=self.policy.get_policy,
             value_fn=self.value.evaluate if use_value else None,
             top_moves_fn=self.policy.get_top_moves,
-            depth=3 if use_value else 1
+            depth=3,
+            use_value=False
+            
         )
 
     def choose_move(self, board):
-        return self.searcher.pick_move(board, time_limit=2.5, max_depth=4)
+        return self.searcher.pick_move(board, time_limit=2.5, max_depth=3, )

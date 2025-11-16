@@ -2,21 +2,45 @@
 
 import time
 import math
-from typing import Optional
+from typing import Optional, Dict, Tuple, List
 
 import chess
 from src.move_index import move_to_index
 
 
+class MCTSNode:
+    """
+    Single node in the MCTS tree.
+    Q, N are stored from the ROOT player's perspective.
+    """
+    def __init__(self, prior: float = 1.0):
+        # Prior of this node from its parent edge (not heavily used for root).
+        self.P = prior
+
+        # Node statistics (from root's perspective)
+        self.N = 0          # total visits to this node
+        self.W = 0.0        # total value of simulations
+        self.Q = 0.0        # mean value (= W / N)
+
+        # Expansion state
+        self.is_expanded = False
+
+        # Per-move stats (edge statistics)
+        self.priors: Dict[chess.Move, float] = {}   # P(s,a)
+        self.Nsa: Dict[chess.Move, int] = {}        # N(s,a)
+        self.Wsa: Dict[chess.Move, float] = {}      # W(s,a)
+        self.Qsa: Dict[chess.Move, float] = {}      # Q(s,a)
+        self.children: Dict[chess.Move, "MCTSNode"] = {}  # s,a -> child node
+
+
 class SimpleSearch:
     """
-    Strong neural-guided search engine:
-    - Iterative Deepening
-    - Negamax + Alpha-Beta
-    - Transposition Table (keyed by FEN)
-    - Policy-based move ordering at root
-    - Policy-biased root scoring (policy can override noisy value)
-    - MVV-LVA capture ordering inside the tree
+    Monte Carlo Tree Search engine:
+
+    - Policy-guided MCTS (PUCT)
+    - Optional value head for leaf evaluation
+    - Time-based playout budget
+    - Same public interface as previous alpha-beta version
     """
 
     MATE_SCORE = 100000
@@ -29,16 +53,23 @@ class SimpleSearch:
         depth: int = 4,
         policy_root_weight: float = 0.8,
         use_value: bool = True,
+        cpuct: float = 1.5,
     ):
         """
+        policy_fn(board) -> policy vector over all moves (flat array).
+        value_fn(board)  -> scalar value in [-1, 1] from the SIDE-TO-MOVE perspective.
+        top_moves_fn(board, k) -> [(move, prob), ...] for debug printing.
+
+        depth:
+            Used as a soft cap on simulation depth in plies (0 = root).
         policy_root_weight:
-            How much policy prior influences the FINAL root decision.
-            Higher -> closer to pure policy, lower -> closer to pure value search.
+            Unused in pure MCTS logic, kept for interface compatibility.
         use_value:
-            If False, disable the value head completely (engine becomes policy-guided
-            with a search skeleton, but evaluation is always 0 except mates).
+            If False, the value head is ignored and a simple neutral evaluation (0)
+            is used at non-terminal leaves (search is then more rollout-like).
+        cpuct:
+            Exploration constant for PUCT; higher = more exploration.
         """
-        # depth = maximum search depth for iterative deepening
         self.policy_fn = policy_fn
         self.value_fn = value_fn
         self.top_moves_fn = top_moves_fn
@@ -46,14 +77,13 @@ class SimpleSearch:
 
         self.policy_root_weight = policy_root_weight
         self.use_value = use_value
+        self.cpuct = cpuct
 
         # Move index mapping for policy
         self.move_index_fn = move_to_index
 
-        # Transposition table: key (FEN) -> {depth, value, flag, best_move}
-        self.tt = {}
-
-        # Search state
+        # Tree & search state
+        self.root: Optional[MCTSNode] = None
         self.nodes = 0
         self.start_time = 0.0
         self.time_limit: Optional[float] = None
@@ -69,283 +99,297 @@ class SimpleSearch:
         max_depth: Optional[int] = None,
     ) -> Optional[chess.Move]:
         """
-        Choose a move using iterative deepening up to max_depth (default: self.max_depth)
-        and within time_limit seconds.
+        Choose a move using MCTS within `time_limit` seconds.
+        `max_depth` (if given) overrides the constructor's `depth` as
+        the maximum plies per simulation.
         """
-        if max_depth is None:
-            max_depth = self.max_depth
+        if max_depth is not None:
+            self.max_depth = max_depth
 
         legal_moves = list(board.legal_moves)
         if not legal_moves:
             return None
 
         # Reset search context
-        self.tt.clear()
         self.nodes = 0
         self.time_limit = time_limit
         self.start_time = time.time()
         self.stop = False
 
-        # Root policy priors for move ordering and bias
-        priors = self._compute_policy_priors(board, legal_moves)
-
-        # Optional: print top-policy moves
+        # Optional: print top-policy moves (pure policy, no search)
         if self.top_moves_fn:
+            priors_for_print = self._compute_policy_priors(board, legal_moves)
             print("\nEngine top-policy moves:")
             for mv, p in self.top_moves_fn(board, 10):
+                # in case top_moves_fn is independent from priors_for_print
                 print(f"  {mv.uci()}   {p:.4f}")
 
-        best_move: Optional[chess.Move] = None
-        best_score = -math.inf
-        previous_pv_move: Optional[chess.Move] = None
+        # Initialize root node; we track values from root player's perspective
+        self.root = MCTSNode(prior=1.0)
 
-        # ============================================================
-        # ITERATIVE DEEPENING
-        # ============================================================
-        for depth in range(1, max_depth + 1):
-            if self.stop:
-                break
+        # Run simulations until we run out of time
+        while not self._out_of_time():
+            # We must operate on a copy of the board for each simulation
+            b_copy = board.copy()
+            self._run_simulation(b_copy, self.root)
 
-            score, move = self._search_root(
-                board,
-                depth,
-                priors,
-                previous_pv_move,
-            )
+        # After search, choose move with highest visit count at root
+        root = self.root
+        legal = list(board.legal_moves)
 
-            if self.stop:
-                break
+        if root is None or not root.is_expanded:
+            # Fallback to pure policy if something went wrong
+            priors = self._compute_policy_priors(board, legal)
+            return max(legal, key=lambda m: priors[m])
 
-            if move is not None:
-                best_move = move
-                best_score = score
-                previous_pv_move = move
+        best_move = None
+        best_visits = -1
 
-            # Debug if you want:
-            # print(f"[Search] depth={depth} score={score:.3f} nodes={self.nodes}")
+        for mv in legal:
+            visits = root.Nsa.get(mv, 0)
+            if visits > best_visits:
+                best_visits = visits
+                best_move = mv
 
-        # Fallback if we never completed depth 1
+        # Fallback if no visits (shouldn't really happen)
         if best_move is None:
-            best_move = max(legal_moves, key=lambda m: priors[m])
+            priors = self._compute_policy_priors(board, legal)
+            best_move = max(legal, key=lambda m: priors[m])
 
         return best_move
 
     # ======================================================================
-    # ROOT LEVEL SEARCH
+    # MCTS CORE
     # ======================================================================
-    def _search_root(
-        self,
-        board: chess.Board,
-        depth: int,
-        priors: dict,
-        previous_pv_move: Optional[chess.Move],
-    ):
-        alpha = -math.inf
-        beta = math.inf
+    def _run_simulation(self, board: chess.Board, root_node: MCTSNode):
+        """
+        One full MCTS simulation from root:
+            selection -> expansion -> evaluation -> backup
+        All Q, W, N are stored in root-player perspective.
+        """
+        node = root_node
+        path: List[Tuple[MCTSNode, Optional[chess.Move]]] = []
+        depth = 0
 
-        legal_moves = list(board.legal_moves)
-
-        # Order: previous PV move first (if still legal), then by policy prior
-        ordered: list[chess.Move] = []
-        if previous_pv_move in legal_moves:
-            ordered.append(previous_pv_move)
-            legal_moves.remove(previous_pv_move)
-
-        remaining = sorted(legal_moves, key=lambda m: priors[m], reverse=True)
-        ordered.extend(remaining)
-
-        best_score = -math.inf
-        best_move: Optional[chess.Move] = None
-
-        for mv in ordered:
+        # --- SELECTION & EXPANSION --------------------------------------
+        while True:
             if self._out_of_time():
+                return
+
+            # If game is over, evaluate terminal and stop
+            if board.is_game_over():
+                leaf_value_side = self._terminal_value_from_side_to_move(board)
                 break
 
-            board.push(mv)
-            search_score = -self._search(board, depth - 1, -beta, -alpha)
-            board.pop()
-
-            if self.stop:
+            # Depth limit: treat as leaf (no further expansion)
+            if self.max_depth is not None and depth >= self.max_depth:
+                leaf_value_side = self._leaf_value_from_side_to_move(board)
                 break
 
-            # ---- ROOT-LEVEL POLICY BIAS --------------------------------
-            # combined_score = value-search-score + policy bonus
-            prior = priors.get(mv, 0.0)
-            combined_score = search_score + self.policy_root_weight * prior
+            if not node.is_expanded:
+                # Expand this node and evaluate with NN (or heuristic)
+                leaf_value_side = self._expand_node(node, board)
+                break
 
-            if combined_score > best_score:
-                best_score = combined_score
-                best_move = mv
+            # Otherwise, select a child via PUCT
+            move = self._select_child_move(node)
+            path.append((node, move))
 
-            # Alpha-beta window at root is based on *search* score,
-            # so we don't feed the policy bias back into the tree.
-            if search_score > alpha:
-                alpha = search_score
+            board.push(move)
+            depth += 1
 
-        return best_score, best_move
+            child = node.children.get(move)
+            if child is None:
+                # Create a new (unexpanded) child node with the edge prior
+                prior = node.priors.get(move, 0.0)
+                child = MCTSNode(prior=prior)
+                node.children[move] = child
 
-    # ======================================================================
-    # CORE SEARCH (NEGAMAX + ALPHA-BETA + TRANSPOSITION TABLE)
-    # ======================================================================
-    def _search(
-        self,
-        board: chess.Board,
-        depth: int,
-        alpha: float,
-        beta: float,
-    ) -> float:
-        if self._out_of_time():
-            return self._evaluate(board)
+            node = child
+
+        # leaf_value_side: value from perspective of SIDE TO MOVE at leaf position
+        # Convert to root player's perspective:
+        # if an odd number of plies from root, sign flip
+        root_value = leaf_value_side * ((-1) ** depth)
+
+        # --- BACKUP ------------------------------------------------------
+        # Update stats along the path (from root to leaf)
+        # Path contains all (node, move) pairs along edges.
+        for n, mv in path:
+            n.N += 1
+            n.W += root_value
+            n.Q = n.W / n.N
+
+            if mv is not None:
+                n.Nsa[mv] = n.Nsa.get(mv, 0) + 1
+                n.Wsa[mv] = n.Wsa.get(mv, 0.0) + root_value
+                n.Qsa[mv] = n.Wsa[mv] / n.Nsa[mv]
+
+        # Also count visit for the final node (leaf)
+        node.N += 1
+        node.W += root_value
+        node.Q = node.W / node.N
 
         self.nodes += 1
 
-        # Leaf / terminal
-        if depth <= 0 or board.is_game_over():
-            return self._evaluate(board)
+    def _expand_node(self, node: MCTSNode, board: chess.Board) -> float:
+        """
+        Expand node:
+            - get legal moves
+            - compute policy priors for these moves
+            - (optionally) evaluate value from value head
+        Returns value from SIDE-TO-MOVE perspective at this node.
+        """
+        legal_moves = list(board.legal_moves)
 
-        # --- TRANSPOSITION TABLE LOOKUP --------------------------------
-        key = board.fen()  # robust in any version: use FEN as TT key
-        tt_entry = self.tt.get(key)
+        if not legal_moves:
+            # No legal moves: terminal; delegate to terminal evaluator.
+            node.is_expanded = True
+            return self._terminal_value_from_side_to_move(board)
 
-        if tt_entry is not None and tt_entry["depth"] >= depth:
-            flag = tt_entry["flag"]
-            val = tt_entry["value"]
+        # Compute policy priors for all legal moves, normalized
+        priors = self._compute_policy_priors(board, legal_moves)
 
-            if flag == "EXACT":
-                return val
-            elif flag == "LOWER":
-                alpha = max(alpha, val)
-            elif flag == "UPPER":
-                beta = min(beta, val)
+        node.priors = priors
+        node.is_expanded = True
 
-            if alpha >= beta:
-                return val
+        # Value from side-to-move perspective
+        leaf_value = self._leaf_value_from_side_to_move(board)
+        return leaf_value
 
-        alpha_orig = alpha
-        best_value = -math.inf
-        best_move: Optional[chess.Move] = None
+    def _select_child_move(self, node: MCTSNode) -> chess.Move:
+        """
+        PUCT selection:
+            a* = argmax_a [ Q(s,a) + cpuct * P(s,a) * sqrt(sum_b N(s,b)) / (1 + N(s,a)) ]
+        All Q values are from root player's perspective.
+        """
+        cpuct = self.cpuct
 
-        # MOVE ORDERING
-        legal = list(board.legal_moves)
-        ordered: list[chess.Move] = []
+        # Total edge visits from this node
+        total_N = sum(node.Nsa.get(m, 0) for m in node.priors.keys())
+        sqrt_total_N = math.sqrt(total_N + 1e-8)
 
-        # 1) TT best move first (if available and legal)
-        if tt_entry and tt_entry["best_move"] in legal:
-            tt_best = tt_entry["best_move"]
-            ordered.append(tt_best)
-            legal.remove(tt_best)
+        best_score = -float("inf")
+        best_move = None
 
-        # 2) Captures (MVV-LVA) then quiet moves
-        captures = []
-        quiets = []
-        for mv in legal:
-            if board.is_capture(mv):
-                captures.append(mv)
-            else:
-                quiets.append(mv)
+        for mv, prior in node.priors.items():
+            Nsa = node.Nsa.get(mv, 0)
+            Qsa = node.Qsa.get(mv, 0.0)
 
-        def mvv_lva(mv: chess.Move) -> int:
-            victim = board.piece_at(mv.to_square)
-            attacker = board.piece_at(mv.from_square)
-            if victim is None or attacker is None:
-                return 0
-            val = {
-                chess.PAWN: 100,
-                chess.KNIGHT: 320,
-                chess.BISHOP: 330,
-                chess.ROOK: 500,
-                chess.QUEEN: 900,
-                chess.KING: 20000,
-            }
-            return val[victim.piece_type] * 10 - val[attacker.piece_type]
+            U = cpuct * prior * sqrt_total_N / (1 + Nsa)
+            score = Qsa + U
 
-        captures.sort(key=mvv_lva, reverse=True)
-        ordered.extend(captures)
-        ordered.extend(quiets)
-
-        # NEGAMAX LOOP
-        for mv in ordered:
-            board.push(mv)
-            score = -self._search(board, depth - 1, -beta, -alpha)
-            board.pop()
-
-            if self.stop:
-                # Just propagate something upwards so recursion unwinds
-                return alpha
-
-            if score > best_value:
-                best_value = score
+            if score > best_score:
+                best_score = score
                 best_move = mv
 
-            if score > alpha:
-                alpha = score
-                if alpha >= beta:
-                    break  # beta cutoff
+        # In degenerate cases, just pick some legal move
+        if best_move is None:
+            best_move = next(iter(node.priors.keys()))
 
-        # --- WRITE TO TRANSPOSITION TABLE ----------------------------
-        if best_value <= alpha_orig:
-            flag = "UPPER"
-        elif best_value >= beta:
-            flag = "LOWER"
-        else:
-            flag = "EXACT"
-
-        self.tt[key] = {
-            "depth": depth,
-            "value": best_value,
-            "flag": flag,
-            "best_move": best_move,
-        }
-
-        return best_value
+        return best_move
 
     # ======================================================================
-    # INTERNAL HELPERS
+    # EVALUATION HELPERS
     # ======================================================================
     def _compute_policy_priors(self, board: chess.Board, legal_moves):
-        """Policy is optional but powerful for move ordering at the root."""
+        """
+        Map full policy vector to legal moves and renormalize.
+        Returns a dict: move -> prior (sum = 1).
+        """
         priors = {}
+
         if self.policy_fn is None:
+            # Uniform prior over legal moves
+            n = len(legal_moves)
+            if n == 0:
+                return {}
+            p = 1.0 / n
             for mv in legal_moves:
-                priors[mv] = 0.0
+                priors[mv] = p
             return priors
 
         policy = self.policy_fn(board)  # assume flat vector over all moves
+
+        total = 0.0
         for mv in legal_moves:
             idx = self.move_index_fn(mv, board)
-            priors[mv] = float(policy[idx])
+            p = float(policy[idx])
+            # clip negatives just in case
+            if p < 0.0:
+                p = 0.0
+            priors[mv] = p
+            total += p
+
+        if total <= 0.0:
+            # If the NN gave all zeros, fall back to uniform
+            n = len(legal_moves)
+            p = 1.0 / n
+            for mv in legal_moves:
+                priors[mv] = p
+            return priors
+
+        # Normalize
+        for mv in legal_moves:
+            priors[mv] /= total
 
         return priors
 
-    def _evaluate(self, board: chess.Board) -> float:
-        """Exact terminal scores + (optionally) value net."""
-        if board.is_game_over():
-            if board.is_checkmate():
-                # Side to move is checkmated => big negative score
-                return -self.MATE_SCORE
-            # Stalemate, repetition, etc.
+    def _terminal_value_from_side_to_move(self, board: chess.Board) -> float:
+        """
+        Returns value from perspective of SIDE TO MOVE at this terminal state:
+            checkmated side -> -1
+            draw           -> 0
+        """
+        if not board.is_game_over():
             return 0.0
 
+        if board.is_checkmate():
+            # Side to move is checkmated -> loss
+            return -1.0
+
+        # Stalemate, repetition, 50-move rule, etc.
+        return 0.0
+
+    def _leaf_value_from_side_to_move(self, board: chess.Board) -> float:
+        """
+        Non-terminal leaf evaluation from SIDE-TO-MOVE perspective.
+        Uses value head if available and enabled; otherwise returns 0.
+        """
+        # If the game is already over, defer to terminal evaluator
+        if board.is_game_over():
+            return self._terminal_value_from_side_to_move(board)
+
         if not self.use_value or self.value_fn is None:
-            # Ignore value head entirely if disabled
             return 0.0
 
         v = self.value_fn(board)
 
-        # Try to be robust to torch / numpy / float
+        # Support torch / numpy / float
         try:
-            import torch
+            import torch  # type: ignore
 
             if isinstance(v, torch.Tensor):
-                return float(v.detach().cpu().item())
+                v = float(v.detach().cpu().item())
         except Exception:
             pass
 
         try:
-            return float(v)
+            v = float(v)
         except Exception:
-            return 0.0
+            v = 0.0
 
+        # Optionally clamp to [-1, 1]
+        if v > 1.0:
+            v = 1.0
+        elif v < -1.0:
+            v = -1.0
+
+        return v
+
+    # ======================================================================
+    # TIME CONTROL
+    # ======================================================================
     def _out_of_time(self) -> bool:
         if self.time_limit is None:
             return False
