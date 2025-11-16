@@ -11,6 +11,8 @@ Architecture:
 Models are trained separately and loaded from weights/ directory
 """
 
+from huggingface_hub import hf_hub_download
+
 import chess
 import torch
 import torch.nn as nn
@@ -135,7 +137,7 @@ class ResidualBlock(nn.Module):
 
 
 # ============================================================================
-# POLICY MODEL (matches friend's architecture)
+# POLICY MODEL
 # ============================================================================
 class PolicyModel(nn.Module):
     """
@@ -410,12 +412,6 @@ class ChessBot:
             policy_path: Path to policy model weights
             value_path: Path to value model weights
         """
-        # Set default paths
-        if policy_path is None:
-            policy_path = os.path.join(os.path.dirname(__file__), "weights", "policy_resnet.pt")
-        if value_path is None:
-            value_path = os.path.join(os.path.dirname(__file__), "weights", "value_model.pth")
-        
         # Initialize models
         self.policy_model = PolicyModel(policy_size=4672)
         self.value_model = ValueModel(channels=128, num_blocks=12)
@@ -423,18 +419,22 @@ class ChessBot:
         # Load trained weights
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        if os.path.exists(policy_path):
-            self.policy_model.load_state_dict(torch.load(policy_path, map_location=device, weights_only=False))
-            print(f"[OK] Loaded policy model from {policy_path}")
-        else:
-            print(f"[WARNING] Policy model not found at {policy_path}")
-        
-        if os.path.exists(value_path):
-            self.value_model.load_state_dict(torch.load(value_path, map_location=device, weights_only=False))
-            print(f"[OK] Loaded value model from {value_path}")
-        else:
-            print(f"[WARNING] Value model not found at {value_path}")
-        
+        repo_id = "Kahanesque/chesshacks-anderrsens-bot"
+
+        print("[INFO] Downloading weights from HuggingFace Hub...")
+
+        policy_path = hf_hub_download(repo_id=repo_id, filename="policy_resnet.pt")
+        value_path = hf_hub_download(repo_id=repo_id, filename="value_model.pth")
+
+        # Load state dicts
+        self.policy_model.load_state_dict(
+            torch.load(policy_path, map_location=device, weights_only=False)
+        )
+        self.value_model.load_state_dict(
+            torch.load(value_path, map_location=device, weights_only=False)
+        )
+
+        print("[OK] Models loaded from HuggingFace Hub.")
         # Set models to evaluation mode
         self.policy_model.eval()
         self.value_model.eval()
