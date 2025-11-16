@@ -283,9 +283,6 @@ class ValueModel(nn.Module):
         v = v.view(v.size(0), -1)
         v = F.relu(self.fc_value1(v))
         v = self.fc_value2(v)
-
-        # Output MUST be in [-1, 1]
-        v = torch.tanh(v)
         return v
 
     @torch.no_grad()
