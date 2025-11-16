@@ -1,12 +1,12 @@
 # main.py - Chess Bot Entry Point for ChessHacks Platform
 
 """
-Chess Bot with Policy Model + Value Model + Search
+Chess Bot with Policy Model + Value Model + Minimax Search
 
 Architecture:
-1. Policy Model generates top-N candidate moves
-2. Value Model evaluates board positions
-3. Search function selects best move from candidates
+1. Policy Model (17 channels) generates top-N candidate moves
+2. Value Model (18 channels) evaluates board positions
+3. Minimax search selects best move from candidates
 
 Models are trained separately and loaded from weights/ directory
 """
@@ -19,120 +19,166 @@ from typing import List, Tuple, Optional
 import os
 
 # ============================================================================
-# BOARD ENCODING
+# BOARD ENCODING - POLICY MODEL (17 channels)
 # ============================================================================
-class BoardEncoder:
-    """Encodes chess board into tensor representation for neural networks"""
+class PolicyBoardEncoder:
+    """
+    17-channel encoding for policy model (matches friend's training)
+    
+    Channels:
+    - 0-5: White pieces (P, N, B, R, Q, K)
+    - 6-11: Black pieces (P, N, B, R, Q, K)
+    - 12: Repetition
+    - 13: Turn
+    - 14-16: Castling rights (WK, WQ, BK+BQ combined)
+    """
     
     @staticmethod
     def encode_board(board: chess.Board) -> torch.Tensor:
-        """
-        Convert board to neural network input
-        
-        Encoding scheme (12 planes):
-        - Planes 0-5: White pieces (P, N, B, R, Q, K)
-        - Planes 6-11: Black pieces (P, N, B, R, Q, K)
-        
-        Returns: tensor of shape (12, 8, 8)
-        """
-        planes = torch.zeros(12, 8, 8, dtype=torch.float32)
+        """Returns tensor of shape (17, 8, 8)"""
+        planes = torch.zeros(17, 8, 8, dtype=torch.float32)
         
         piece_idx = {
-            chess.PAWN: 0,
-            chess.KNIGHT: 1,
-            chess.BISHOP: 2,
-            chess.ROOK: 3,
-            chess.QUEEN: 4,
-            chess.KING: 5
+            chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
+            chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
         }
         
+        # Piece positions
         for square in chess.SQUARES:
             piece = board.piece_at(square)
             if piece:
                 rank = chess.square_rank(square)
                 file = chess.square_file(square)
-                
                 plane_idx = piece_idx[piece.piece_type]
                 if piece.color == chess.BLACK:
                     plane_idx += 6
-                
                 planes[plane_idx, rank, file] = 1.0
         
-        return planes
-    
-    @staticmethod
-    def move_to_index(move: chess.Move) -> int:
-        """
-        Convert move to action index for policy model
-        Simple encoding: from_square * 64 + to_square
-        (For promotion moves, you may need more sophisticated encoding)
-        """
-        return move.from_square * 64 + move.to_square
-    
-    @staticmethod
-    def index_to_move(index: int, board: chess.Board) -> Optional[chess.Move]:
-        """Convert action index back to move (if legal)"""
-        from_square = index // 64
-        to_square = index % 64
-        move = chess.Move(from_square, to_square)
+        # Metadata
+        planes[12, :, :] = 0.0  # Repetition
+        planes[13, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
+        planes[14, :, :] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
+        planes[15, :, :] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
+        # Combine both black castling rights into one channel
+        planes[16, :, :] = 1.0 if (board.has_kingside_castling_rights(chess.BLACK) or 
+                                     board.has_queenside_castling_rights(chess.BLACK)) else 0.0
         
-        if move in board.legal_moves:
-            return move
-        return None
+        return planes
 
 
 # ============================================================================
-# POLICY MODEL
+# BOARD ENCODING - VALUE MODEL (18 channels)
+# ============================================================================
+class ValueBoardEncoder:
+    """
+    18-channel encoding for value model (matches our training)
+    
+    Channels:
+    - 0-5: White pieces (P, N, B, R, Q, K)
+    - 6-11: Black pieces (P, N, B, R, Q, K)
+    - 12: Repetition
+    - 13: Turn
+    - 14-17: Castling rights (WK, WQ, BK, BQ)
+    """
+    
+    @staticmethod
+    def encode_board(board: chess.Board) -> torch.Tensor:
+        """Returns tensor of shape (18, 8, 8)"""
+        planes = torch.zeros(18, 8, 8, dtype=torch.float32)
+        
+        piece_idx = {
+            chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
+            chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
+        }
+        
+        # Piece positions
+        for square in chess.SQUARES:
+            piece = board.piece_at(square)
+            if piece:
+                rank = chess.square_rank(square)
+                file = chess.square_file(square)
+                plane_idx = piece_idx[piece.piece_type]
+                if piece.color == chess.BLACK:
+                    plane_idx += 6
+                planes[plane_idx, rank, file] = 1.0
+        
+        # Metadata
+        planes[12, :, :] = 0.0  # Repetition
+        planes[13, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
+        planes[14, :, :] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
+        planes[15, :, :] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
+        planes[16, :, :] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
+        planes[17, :, :] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
+        
+        return planes
+
+
+# ============================================================================
+# RESIDUAL BLOCK (shared by both models)
+# ============================================================================
+class ResidualBlock(nn.Module):
+    """Residual block for deep network"""
+    
+    def __init__(self, channels=128, use_bias=True):
+        super().__init__()
+        # Value model was trained WITH bias, policy model WITHOUT
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=use_bias)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=use_bias)
+        self.bn2 = nn.BatchNorm2d(channels)
+    
+    def forward(self, x):
+        identity = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return F.relu(out + identity)
+
+
+# ============================================================================
+# POLICY MODEL (matches friend's architecture)
 # ============================================================================
 class PolicyModel(nn.Module):
     """
-    Neural network that predicts move probabilities
-    
-    Architecture: Convolutional layers + Policy head
-    Input: (12, 8, 8) board representation
-    Output: Probability distribution over moves
+    Policy network that predicts move probabilities
+    Architecture matches friend's PolicyNetRes (17 channels, 8 residual blocks)
     """
     
-    def __init__(self, input_channels: int = 12, hidden_channels: int = 128, num_res_blocks: int = 4):
+    def __init__(self, policy_size=4672):
         super().__init__()
         
-        # Initial convolution
-        self.conv_input = nn.Conv2d(input_channels, hidden_channels, kernel_size=3, padding=1)
-        self.bn_input = nn.BatchNorm2d(hidden_channels)
+        self.conv_in = nn.Sequential(
+            nn.Conv2d(17, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+        )
         
-        # Residual blocks
-        self.res_blocks = nn.ModuleList([
-            ResidualBlock(hidden_channels) for _ in range(num_res_blocks)
-        ])
+        # Policy residual blocks were trained WITHOUT bias on convs — pass use_bias=False
+        self.res_layers = nn.Sequential(
+        *[ResidualBlock(128, use_bias=False) for _ in range(8)]
+)
         
-        # Policy head
-        self.policy_conv = nn.Conv2d(hidden_channels, 32, kernel_size=1)
-        self.policy_bn = nn.BatchNorm2d(32)
-        self.policy_fc = nn.Linear(32 * 8 * 8, 4096)  # 64*64 possible moves
-        
+        self.policy_head = nn.Sequential(
+            nn.Conv2d(128, 32, kernel_size=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(32 * 8 * 8, policy_size)
+        )
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass
         
         Args:
-            x: Board tensor of shape (batch, 12, 8, 8)
+            x: Board tensor of shape (batch, 17, 8, 8)
         
         Returns:
-            Move logits of shape (batch, 4096)
+            Move logits of shape (batch, policy_size)
         """
-        # Input convolution
-        x = F.relu(self.bn_input(self.conv_input(x)))
-        
-        # Residual blocks
-        for block in self.res_blocks:
-            x = block(x)
-        
-        # Policy head
-        policy = F.relu(self.policy_bn(self.policy_conv(x)))
-        policy = policy.view(policy.size(0), -1)
-        policy = self.policy_fc(policy)
-        
-        return policy
+        x = self.conv_in(x)
+        x = self.res_layers(x)
+        x = self.policy_head(x)
+        return x
     
     @torch.no_grad()
     def get_top_n_moves(self, board: chess.Board, n: int = 10) -> List[Tuple[chess.Move, float]]:
@@ -148,19 +194,29 @@ class PolicyModel(nn.Module):
         """
         self.eval()
         
-        # Encode board
-        board_tensor = BoardEncoder.encode_board(board).unsqueeze(0)  # Add batch dimension
-        
+        # Encode board (17 channels)
+        board_tensor = PolicyBoardEncoder.encode_board(board).unsqueeze(0)
+
+        # Move encoded board to the same device as the model
+        device = next(self.parameters()).device
+        board_tensor = board_tensor.to(device)
+
         # Get move logits
-        logits = self.forward(board_tensor).squeeze(0)  # Remove batch dimension
+        logits = self.forward(board_tensor).squeeze(0)
         probs = F.softmax(logits, dim=0)
         
-        # Filter for legal moves and get top N
+        # Get all legal moves with their probabilities
         legal_moves = []
         for move in board.legal_moves:
-            move_idx = BoardEncoder.move_to_index(move)
+            # Simple encoding: from_square * 64 + to_square
+            move_idx = move.from_square * 64 + move.to_square
             if move_idx < len(probs):
                 legal_moves.append((move, probs[move_idx].item()))
+        
+        # If no moves matched (shouldn't happen), use uniform distribution
+        if not legal_moves:
+            legal_moves = [(move, 1.0 / len(list(board.legal_moves))) 
+                          for move in board.legal_moves]
         
         # Sort by probability and take top N
         legal_moves.sort(key=lambda x: x[1], reverse=True)
@@ -168,60 +224,52 @@ class PolicyModel(nn.Module):
 
 
 # ============================================================================
-# VALUE MODEL
+# VALUE MODEL (18 channels, 12 residual blocks)
 # ============================================================================
 class ValueModel(nn.Module):
     """
     Neural network that evaluates board positions
-    
-    Architecture: Convolutional layers + Value head
-    Input: (12, 8, 8) board representation
-    Output: Position evaluation (win probability from white's perspective)
+    Trained with 18 channels and Huber loss
     """
     
-    def __init__(self, input_channels: int = 12, hidden_channels: int = 128, num_res_blocks: int = 4):
+    def __init__(self, channels=128, num_blocks=12):
         super().__init__()
         
-        # Initial convolution
-        self.conv_input = nn.Conv2d(input_channels, hidden_channels, kernel_size=3, padding=1)
-        self.bn_input = nn.BatchNorm2d(hidden_channels)
+        # Input convolution (18 channels)
+        self.conv_in = nn.Conv2d(18, channels, kernel_size=3, padding=1)
+        self.bn_in = nn.BatchNorm2d(channels)
         
         # Residual blocks
-        self.res_blocks = nn.ModuleList([
-            ResidualBlock(hidden_channels) for _ in range(num_res_blocks)
-        ])
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(channels) for _ in range(num_blocks)]
+        )
         
         # Value head
-        self.value_conv = nn.Conv2d(hidden_channels, 8, kernel_size=1)
-        self.value_bn = nn.BatchNorm2d(8)
-        self.value_fc1 = nn.Linear(8 * 8 * 8, 256)
-        self.value_fc2 = nn.Linear(256, 1)
+        self.conv_value = nn.Conv2d(channels, 8, kernel_size=1)
+        self.bn_value = nn.BatchNorm2d(8)
+        self.fc_value1 = nn.Linear(8 * 8 * 8, 256)
+        self.fc_value2 = nn.Linear(256, 1)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass
         
         Args:
-            x: Board tensor of shape (batch, 12, 8, 8)
+            x: Board tensor of shape (batch, 18, 8, 8)
         
         Returns:
-            Value evaluation of shape (batch, 1) in range [-1, 1]
-            (1 = white winning, -1 = black winning, 0 = draw)
+            Value evaluation of shape (batch, 1) in centipawns
         """
-        # Input convolution
-        x = F.relu(self.bn_input(self.conv_input(x)))
-        
-        # Residual blocks
-        for block in self.res_blocks:
-            x = block(x)
+        x = F.relu(self.bn_in(self.conv_in(x)))
+        x = self.blocks(x)
         
         # Value head
-        value = F.relu(self.value_bn(self.value_conv(x)))
-        value = value.view(value.size(0), -1)
-        value = F.relu(self.value_fc1(value))
-        value = torch.tanh(self.value_fc2(value))  # Output in [-1, 1]
+        v = F.relu(self.bn_value(self.conv_value(x)))
+        v = v.view(v.size(0), -1)
+        v = F.relu(self.fc_value1(v))
+        v = self.fc_value2(v)
         
-        return value
+        return v
     
     @torch.no_grad()
     def evaluate_position(self, board: chess.Board) -> float:
@@ -232,139 +280,118 @@ class ValueModel(nn.Module):
             board: Chess position to evaluate
         
         Returns:
-            Evaluation score from current player's perspective
-            Positive = current player is winning
-            Negative = current player is losing
+            Evaluation score in centipawns from current player's perspective
         """
         self.eval()
         
-        # Encode board
-        board_tensor = BoardEncoder.encode_board(board).unsqueeze(0)  # Add batch dimension
+        # Encode board (18 channels)
+        board_tensor = ValueBoardEncoder.encode_board(board).unsqueeze(0)
         
-        # Get evaluation (from white's perspective)
-        eval_white = self.forward(board_tensor).squeeze().item()
+        # Move encoded board to model device
+        device = next(self.parameters()).device
+        board_tensor = board_tensor.to(device)    
+            
+        # Get evaluation (already from current player's perspective)
+        eval_cp = self.forward(board_tensor).squeeze().item()
         
-        # Flip perspective if black to move
-        if board.turn == chess.BLACK:
-            return -eval_white
-        return eval_white
+        return eval_cp
 
 
 # ============================================================================
-# RESIDUAL BLOCK (shared by both models)
+# MINIMAX SEARCH ENGINE
 # ============================================================================
-class ResidualBlock(nn.Module):
-    """Residual block for deep network"""
-    
-    def __init__(self, channels: int):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(channels)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += residual
-        out = F.relu(out)
-        return out
-
-
-# ============================================================================
-# SEARCH ENGINE
-# ============================================================================
-class SearchEngine:
+class MinimaxSearch:
     """
-    Search algorithm using policy + value models
-    
-    Strategy: Get top-N moves from policy, evaluate resulting positions
-    with value model, select best move.
+    Minimax search with alpha-beta pruning using policy + value models
     """
     
     def __init__(self, policy_model: PolicyModel, value_model: ValueModel):
         self.policy_model = policy_model
         self.value_model = value_model
+        self.nodes_searched = 0
     
-    def search(self, board: chess.Board, top_n: int = 10, depth: int = 1) -> chess.Move:
+    def search(self, board: chess.Board, depth: int = 3, top_n: int = 10) -> Tuple[chess.Move, float]:
         """
-        Select best move using policy + value models
+        Minimax search to find best move
         
         Args:
             board: Current chess position
-            top_n: Number of candidate moves to consider from policy
-            depth: Search depth (1 = evaluate immediate positions only)
+            depth: Search depth (ply)
+            top_n: Number of candidate moves from policy at each node
         
         Returns:
-            Best move selected
+            (best_move, evaluation) tuple
         """
-        # Get candidate moves from policy model
+        self.nodes_searched = 0
+        
+        # Get candidate moves from policy
         candidates = self.policy_model.get_top_n_moves(board, n=top_n)
         
         if not candidates:
-            # Fallback: return any legal move
-            return list(board.legal_moves)[0]
+            # Fallback
+            legal_moves = list(board.legal_moves)
+            if legal_moves:
+                return legal_moves[0], 0.0
+            else:
+                raise ValueError("No legal moves available")
         
-        # Evaluate each candidate
         best_move = None
         best_score = float('-inf')
+        alpha = float('-inf')
+        beta = float('inf')
         
+        # Search each candidate
         for move, policy_prob in candidates:
-            # Make the move
             board.push(move)
             
-            # Evaluate the resulting position
-            # Note: Value is from opponent's perspective after the move
-            # so we negate it to get our perspective
-            if depth == 1:
-                score = -self.value_model.evaluate_position(board)
-            else:
-                # For depth > 1, implement recursive search
-                score = self._search_recursive(board, depth - 1, alpha=float('-inf'), beta=float('inf'))
+            # Recursive minimax (negate for opponent)
+            score = -self._minimax(board, depth - 1, -beta, -alpha, top_n)
             
-            # Undo the move
             board.pop()
             
-            # Track best move
             if score > best_score:
                 best_score = score
                 best_move = move
+            
+            alpha = max(alpha, score)
         
-        return best_move
+        return best_move, best_score
     
-    def _search_recursive(self, board: chess.Board, depth: int, alpha: float, beta: float) -> float:
-        """
-        Recursive minimax search with alpha-beta pruning
+    def _minimax(self, board: chess.Board, depth: int, alpha: float, beta: float, top_n: int) -> float:
+        """Recursive minimax with alpha-beta pruning"""
+        self.nodes_searched += 1
         
-        Args:
-            board: Current position
-            depth: Remaining search depth
-            alpha: Alpha value for pruning
-            beta: Beta value for pruning
-        
-        Returns:
-            Position evaluation from current player's perspective
-        """
-        # Base case: evaluate position
+        # Base case
         if depth == 0 or board.is_game_over():
-            return -self.value_model.evaluate_position(board)
+            if board.is_checkmate():
+                return -10000  # Loss
+            elif board.is_stalemate() or board.is_insufficient_material():
+                return 0  # Draw
+            else:
+                return self.value_model.evaluate_position(board)
         
-        # Get candidate moves (fewer at deeper levels to save time)
-        n_moves = max(5, 10 - depth)
+        # Get candidate moves
+        n_moves = max(5, top_n - (3 - depth))
         candidates = self.policy_model.get_top_n_moves(board, n=n_moves)
         
+        if not candidates:
+            if board.is_checkmate():
+                return -10000
+            else:
+                return 0
+        
         max_eval = float('-inf')
+        
         for move, _ in candidates:
             board.push(move)
-            eval_score = -self._search_recursive(board, depth - 1, -beta, -alpha)
+            eval_score = -self._minimax(board, depth - 1, -beta, -alpha, top_n)
             board.pop()
             
             max_eval = max(max_eval, eval_score)
             alpha = max(alpha, eval_score)
             
             if beta <= alpha:
-                break  # Beta cutoff
+                break  # Pruning
         
         return max_eval
 
@@ -373,44 +400,40 @@ class SearchEngine:
 # MAIN CHESS BOT
 # ============================================================================
 class ChessBot:
-    """
-    Complete chess bot combining policy and value models
-    
-    Models are loaded from saved weights (trained separately)
-    """
+    """Complete chess bot combining policy and value models with minimax search"""
     
     def __init__(self, policy_path: str = None, value_path: str = None):
         """
         Initialize bot with trained models
         
         Args:
-            policy_path: Path to policy model weights (.pth file)
-            value_path: Path to value model weights (.pth file)
+            policy_path: Path to policy model weights
+            value_path: Path to value model weights
         """
-        # Set default paths relative to this file
+        # Set default paths
         if policy_path is None:
-            policy_path = os.path.join(os.path.dirname(__file__), "weights", "policy_model.pth")
+            policy_path = os.path.join(os.path.dirname(__file__), "weights", "policy_resnet.pt")
         if value_path is None:
             value_path = os.path.join(os.path.dirname(__file__), "weights", "value_model.pth")
         
         # Initialize models
-        self.policy_model = PolicyModel()
-        self.value_model = ValueModel()
+        self.policy_model = PolicyModel(policy_size=4672)
+        self.value_model = ValueModel(channels=128, num_blocks=12)
         
         # Load trained weights
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         if os.path.exists(policy_path):
-            self.policy_model.load_state_dict(torch.load(policy_path, map_location=device))
-            print(f"✓ Loaded policy model from {policy_path}")
+            self.policy_model.load_state_dict(torch.load(policy_path, map_location=device, weights_only=False))
+            print(f"[OK] Loaded policy model from {policy_path}")
         else:
-            print(f"⚠ Warning: Policy model not found at {policy_path}, using random weights")
+            print(f"[WARNING] Policy model not found at {policy_path}")
         
         if os.path.exists(value_path):
-            self.value_model.load_state_dict(torch.load(value_path, map_location=device))
-            print(f"✓ Loaded value model from {value_path}")
+            self.value_model.load_state_dict(torch.load(value_path, map_location=device, weights_only=False))
+            print(f"[OK] Loaded value model from {value_path}")
         else:
-            print(f"⚠ Warning: Value model not found at {value_path}, using random weights")
+            print(f"[WARNING] Value model not found at {value_path}")
         
         # Set models to evaluation mode
         self.policy_model.eval()
@@ -421,20 +444,22 @@ class ChessBot:
         self.value_model.to(device)
         
         # Initialize search engine
-        self.search_engine = SearchEngine(self.policy_model, self.value_model)
+        self.search = MinimaxSearch(self.policy_model, self.value_model)
     
-    def get_move(self, board: chess.Board) -> chess.Move:
+    def get_move(self, board: chess.Board, depth: int = 3) -> chess.Move:
         """
         Get the bot's move for a given position
         
         Args:
             board: Current chess position
+            depth: Search depth (default 3 ply)
         
         Returns:
-            Best move selected by the bot
+            Best move selected by minimax search
         """
         with torch.no_grad():
-            move = self.search_engine.search(board, top_n=10, depth=1)
+            move, eval_score = self.search.search(board, depth=depth, top_n=10)
+            print(f"Evaluation: {eval_score:.1f} cp, Nodes: {self.search.nodes_searched}")
         
         return move
 
@@ -451,9 +476,8 @@ from chess import Move
 # ============================================================================
 
 # Initialize bot with trained models
-# Models will be loaded from weights/ directory
 bot = ChessBot()
-print("✓ Chess bot initialized")
+print("[OK] Chess bot initialized with minimax search")
 
 
 # ============================================================================
@@ -466,7 +490,7 @@ def get_move(ctx: GameContext) -> Move:
     ChessHacks platform entrypoint
     
     Args:
-        ctx: GameContext containing current board state and utilities
+        ctx: GameContext containing current board state
     
     Returns:
         python-chess Move object (legal move for current position)
@@ -479,21 +503,24 @@ def get_move(ctx: GameContext) -> Move:
         ctx.logProbabilities({})
         raise ValueError("No legal moves available")
     
-    # Get move from bot using policy + value search
+    # Get move from bot using minimax search
     try:
-        move = bot.get_move(board)
+        move = bot.get_move(board, depth=3)
         
-        # Log move probabilities from policy model for analysis
-        # Get top candidates and their probabilities
+        # Log move probabilities from policy model
+        # IMPORTANT: Keys must be Move objects, not tuples!
         with torch.no_grad():
             candidates = bot.policy_model.get_top_n_moves(board, n=len(legal_moves))
-            move_probs = {m: prob for m, prob in candidates}
+            # Create dict with Move objects as keys (not tuples)
+            move_probs = {move: prob for move, prob in candidates}
             ctx.logProbabilities(move_probs)
         
         return move
     
     except Exception as e:
         print(f"Error in bot.get_move: {e}")
+        import traceback
+        traceback.print_exc()
         # Fallback: return first legal move
         ctx.logProbabilities({})
         return legal_moves[0]
@@ -505,14 +532,5 @@ def get_move(ctx: GameContext) -> Move:
 
 @chess_manager.reset
 def reset_game(ctx: GameContext):
-    """
-    Called at the start of each new game
-    
-    Use this to:
-    - Clear any caches
-    - Reset model state
-    - Clear search history
-    """
-    # Currently no stateful components to reset
-    # Add here if you implement caching, transposition tables, etc.
-    pass
+    """Called at the start of each new game"""
+    bot.search.nodes_searched = 0
