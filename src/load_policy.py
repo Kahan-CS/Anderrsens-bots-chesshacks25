@@ -4,6 +4,8 @@ import torch
 from src.policy_model import PolicyNetRes
 import os
 
+REPO_ID = "Kahanesque/chesshacks-anderrsens-bot"
+policy_path = hf_hub_download(repo_id=repo_id, filename="policy_resnet.pt")
 POLICY_PATH = "src/policy_resnet.pt"
 
 def load_policy_model(device="cpu"):

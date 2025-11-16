@@ -4,6 +4,8 @@ import torch
 import os
 from src.value_model import ValueModel
 
+REPO_ID = "Kahanesque/chesshacks-anderrsens-bot"
+value_path = hf_hub_download(repo_id=repo_id, filename="value_model_2.pth")
 VALUE_PATH = "src/value_model.pth"
 
 def load_value_model(device="cpu"):
