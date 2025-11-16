@@ -424,7 +424,7 @@ class ChessBot:
         print("[INFO] Downloading weights from HuggingFace Hub...")
 
         policy_path = hf_hub_download(repo_id=repo_id, filename="policy_resnet.pt")
-        value_path = hf_hub_download(repo_id=repo_id, filename="value_model_3.pth")
+        value_path = hf_hub_download(repo_id=repo_id, filename="value_model_lichess.pth")
 
         # Load state dicts
         self.policy_model.load_state_dict(

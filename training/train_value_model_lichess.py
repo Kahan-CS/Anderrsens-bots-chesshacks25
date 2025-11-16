@@ -171,54 +171,43 @@ def train_on_modal(
             self.target_samples = int(target_samples)
             self.split = split
             self.seed = seed
-            # Total examples (approx) in dataset: used to compute sampling prob
-            # Using conservative estimate from dataset card:
-            self.TOTAL_EXAMPLES = 784_537_782
-            self.sample_prob = float(self.target_samples) / float(self.TOTAL_EXAMPLES)
-            if self.sample_prob <= 0.0 or self.sample_prob > 1.0:
-                self.sample_prob = min(max(self.sample_prob, 0.000001), 1.0)
-            # For reproducibility
-            random.seed(self.seed)
 
         def __iter__(self):
+            from datasets import load_dataset
+            import chess
+            import torch
+
             ds = load_dataset("Lichess/chess-position-evaluations", split=self.split, streaming=True)
-            count = 0
+            # Shuffle using a buffer, then take exactly target_samples
+            ds = ds.shuffle(seed=self.seed, buffer_size=10_000_000)
+            ds = ds.take(self.target_samples)
+
             for item in ds:
-                # Bernoulli sampling
-                if random.random() < self.sample_prob:
-                    # Parse fen and cp/mate
-                    fen = item.get("fen") or item.get("FEN") or item.get("fenstr") or None
-                    cp = item.get("cp")
-                    mate = item.get("mate")
-                    if fen is None:
-                        continue
-                    try:
-                        board = chess.Board(fen)
-                    except Exception:
-                        continue
+                fen = item.get("fen") or item.get("FEN") or item.get("fenstr") or None
+                cp = item.get("cp")
+                mate = item.get("mate")
+                if fen is None:
+                    continue
+                try:
+                    board = chess.Board(fen)
+                except Exception:
+                    continue
 
-                    # Determine cp target
-                    if cp is None:
-                        # If mate provided, map to strong win/loss
-                        if mate is not None:
-                            cp_val = CLIP_CP if mate > 0 else -CLIP_CP
-                        else:
-                            # fallback: skip if no cp and no mate
-                            continue
+                # Determine cp target
+                if cp is None:
+                    if mate is not None:
+                        cp_val = 2000.0 if mate > 0 else -2000.0
                     else:
-                        cp_val = float(cp)
+                        continue
+                else:
+                    cp_val = float(cp)
 
-                    # Clip + scale
-                    cp_val = max(-CLIP_CP, min(CLIP_CP, cp_val))
-                    scaled = cp_val / TARGET_SCALE  # in [-1,1]
+                # Clip + scale
+                cp_val = max(-2000.0, min(2000.0, cp_val))
+                scaled = cp_val / 2000.0
 
-                    board_tensor = encode_board_18(board)
-                    count += 1
-                    yield board_tensor, torch.tensor(scaled, dtype=torch.float32)
-
-                    if count >= self.target_samples:
-                        break
-            # End iteration
+                board_tensor = encode_board_18(board)
+                yield board_tensor, torch.tensor(scaled, dtype=torch.float32)
 
     # -------------------------------------------------------------------------
     # Checkpoint utilities (same names as earlier, stored in Modal volume)
