@@ -24,7 +24,7 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
         "torch==2.5.1",
-        "datasets==3.12.0",
+        "datasets==4.4.1",
         "python-chess==1.999",
         "tqdm==4.67.1",
         "numpy<2.0",
