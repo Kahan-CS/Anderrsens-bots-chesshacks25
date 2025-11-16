@@ -139,9 +139,10 @@ class ResidualBlock(nn.Module):
 # GROUPNORM RESIDUAL BLOCK (for Value Model only)
 # ============================================================================
 class ResidualBlockGN(nn.Module):
-    """Residual block using GroupNorm (32 groups) for stability on large datasets."""
+    """Residual block using GroupNorm (matches training script)."""
 
-    def __init__(self, channels=128, use_bias=True, num_groups=32):
+    # CORRECTED: num_groups default changed from 32 to 8
+    def __init__(self, channels=128, use_bias=True, num_groups=8): 
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=use_bias)
         self.gn1 = nn.GroupNorm(num_groups=num_groups, num_channels=channels)
@@ -154,7 +155,6 @@ class ResidualBlockGN(nn.Module):
         out = F.relu(self.gn1(self.conv1(x)))
         out = self.gn2(self.conv2(out))
         return F.relu(out + identity)
-
 
 # ============================================================================
 # POLICY MODEL
@@ -246,55 +246,76 @@ class PolicyModel(nn.Module):
 
 
 # ============================================================================
-# VALUE MODEL (18 channels, 12 residual blocks, GroupNorm + tanh)
+# VALUE MODEL (18 channels, 12 residual blocks, GroupNorm)
 # ============================================================================
 class ValueModel(nn.Module):
     """
-    Value network using GroupNorm (stable on huge datasets)
-    Trained to output values in [-1, 1], later scaled to centipawns.
+    Value network using GroupNorm.
+    Architecture MUST match train_value_modal.py
     """
 
-    def __init__(self, channels=128, num_blocks=12):
+    # CORRECTED: Added num_groups=8 to match training default
+    def __init__(self, channels=128, num_blocks=12, num_groups=8):
         super().__init__()
 
         # Input conv
         self.conv_in = nn.Conv2d(18, channels, kernel_size=3, padding=1, bias=True)
-        self.gn_in = nn.GroupNorm(num_groups=32, num_channels=channels)
+        # CORRECTED: Use num_groups (default 8) instead of hardcoded 32
+        self.gn_in = nn.GroupNorm(num_groups=num_groups, num_channels=channels)
 
         # Residual tower using ResidualBlockGN
+        # CORRECTED: Pass the correct num_groups (8) to the blocks
         self.blocks = nn.Sequential(
-            *[ResidualBlockGN(channels, use_bias=True) for _ in range(num_blocks)]
+            *[ResidualBlockGN(channels, num_groups=num_groups, use_bias=True) for _ in range(num_blocks)]
         )
 
         # Value head
-        self.conv_value = nn.Conv2d(channels, 8, kernel_size=1, bias=True)
-        self.gn_value = nn.GroupNorm(num_groups=8, num_channels=8)
-
+        self.conv_value = nn.Conv2d(channels, 8, kernel_size=1)
+        # CORRECTED: Use num_groups=2 (matches training script) instead of hardcoded 8
+        self.gn_value = nn.GroupNorm(num_groups=2, num_channels=8) 
         self.fc_value1 = nn.Linear(8 * 8 * 8, 256)
         self.fc_value2 = nn.Linear(256, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Conv + GN + ReLU
+        """
+        Forward pass
+        
+        Args:
+            x: Board tensor of shape (batch, 18, 8, 8)
+        
+        Returns:
+            Raw scaled value (batch, 1) - NO Tanh
+        """
         x = F.relu(self.gn_in(self.conv_in(x)))
         x = self.blocks(x)
-
-        # Value head
         v = F.relu(self.gn_value(self.conv_value(x)))
         v = v.view(v.size(0), -1)
         v = F.relu(self.fc_value1(v))
         v = self.fc_value2(v)
+        
+        # CORRECTED: Removed torch.tanh() to match training output
         return v
 
     @torch.no_grad()
     def evaluate_position(self, board: chess.Board) -> float:
-        TARGET_SCALE = 2000.0  # same as training
+        """
+        Evaluate position (returns centipawns).
+        Model outputs scaled value -> multiply by TARGET_SCALE.
+        """
         self.eval()
-
-        x = ValueBoardEncoder.encode_board(board).unsqueeze(0)
-        x = x.to(next(self.parameters()).device)
-
-        v_scaled = self.forward(x).squeeze().item()
-        return v_scaled * TARGET_SCALE
+        
+        # Encode board (18 channels)
+        board_tensor = ValueBoardEncoder.encode_board(board).unsqueeze(0)
+        
+        # Move encoded board to the same device as the model
+        device = next(self.parameters()).device
+        board_tensor = board_tensor.to(device)
+        
+        # Get scaled value
+        scaled = self.forward(board_tensor).squeeze().item()
+        
+        # Scale to centipawns (TARGET_SCALE = 2000.0 from training)
+        return scaled * 2000.0
 
 # ============================================================================
 # MINIMAX SEARCH ENGINE
