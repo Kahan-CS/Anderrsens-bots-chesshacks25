@@ -157,85 +157,100 @@ class ResidualBlockGN(nn.Module):
         return F.relu(out + identity)
 
 # ============================================================================
-# MOVE INDEXING LOGIC (FROM engine/move_index.py)
-# WARNING: This logic is flawed and does not handle Knight moves.
+# MOVE INDEXING LOGIC (CORRECTED 8x8x73 = 4672)
 # ============================================================================
-DIRECTIONS = [
-    (1, 0),  (-1, 0),  (0, 1),  (0, -1),
-    (1, 1),  (1, -1), (-1, 1), (-1, -1)
+# ============================================================================
+# MOVE INDEXING LOGIC (CORRECTED 8x8x73 = 4672)
+# ============================================================================
+
+# 8 directions for queen-like moves (dy, dx)
+# N, NE, E, SE, S, SW, W, NW
+QUEEN_DIRS = [
+    (1, 0), (1, 1), (0, 1), (-1, 1),
+    (-1, 0), (-1, -1), (0, -1), (1, -1)
 ]
-PROMO_ORDER = [chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
 
-def move_to_index(move: chess.Move, board: chess.Board) -> int:
-    """
-    EXACT AlphaZero-style 4672 indexing as used in your training data.
-    73 moves per from-square.
+# 8 directions for knight moves (dy, dx)
+KNIGHT_DIRS = [
+    (2, 1), (1, 2), (-1, 2), (-2, 1),
+    (-2, -1), (-1, -2), (1, -2), (2, -1)
+]
 
-    WARNING: This implementation is flawed. It maps all Knight moves
-    to the '0' bucket for their from_square.
-    """
+# 3 types of underpromotions
+PROMO_PIECES = [chess.KNIGHT, chess.BISHOP, chess.ROOK]
 
-    from_sq = move.from_square
-    to_sq = move.to_square
+# --- Pre-build dictionaries for fast lookup ---
 
-    fx = chess.square_file(from_sq)
-    fy = chess.square_rank(from_sq)
-    tx = chess.square_file(to_sq)
-    ty = chess.square_rank(to_sq)
+# 0-55: Queen-like moves (8 directions * 7 distances)
+QUEEN_MAP = {}
+for i, (dy, dx) in enumerate(QUEEN_DIRS):
+    for k in range(1, 8): # distance 1 to 7
+        # plane_index = direction_index * 7 + (distance - 1)
+        plane = i * 7 + (k - 1)
+        QUEEN_MAP[(dy * k, dx * k)] = plane
 
-    dx = tx - fx
-    dy = ty - fy
+# 56-63: Knight moves (8 directions)
+KNIGHT_MAP = {}
+for i, (dy, dx) in enumerate(KNIGHT_DIRS):
+    # plane_index = 56 + knight_direction_index
+    plane = 56 + i
+    KNIGHT_MAP[(dy, dx)] = plane
 
-    # ============================================================
-    # 1. PROMOTIONS
-    # WARNING: Flawed - does not distinguish dx
-    # ============================================================
-    if move.promotion is not None:
-        try:
-            promo_type = PROMO_ORDER.index(move.promotion)  # 0..3
-        except ValueError:
-            return from_sq * 73 # Fallback for non-standard promo?
+# 64-72: Under-promotions (3 directions * 3 pieces)
+UNDER_PROMO_MAP = {}
+for i, piece in enumerate(PROMO_PIECES):
+    for dx in [-1, 0, 1]: # capture left, push, capture right
+        # plane_index = 64 + (delta_x_index * 3) + promo_piece_index
+        # delta_x_index: -1 -> 0, 0 -> 1, 1 -> 2
+        plane = 64 + (dx + 1) * 3 + i
+        UNDER_PROMO_MAP[(dx, piece)] = plane
 
-        # Training used: 56 + (rank_diff * 7) + promo_type
-        # rank_diff = (ty - fy)
-        direction_idx = 56 + (ty - fy) * 7 + promo_type
+    def move_to_index(move: chess.Move, board: chess.Board = None) -> int:
+        """
+        Converts a chess.Move object to the 4672-logit (8*8*73) index
+        used by AlphaZero-style policy networks.
 
-        return from_sq * 73 + direction_idx
+        Indexing scheme (73 planes per 'from' square):
+        - 0-55: Queen-like moves (8 directions, 7 squares each)
+        - 56-63: Knight moves (8 directions)
+        - 64-72: Under-promotions (3 directions [L, F, R] x 3 pieces [N, B, R])
+                (Queen promotions are encoded as queen-like moves)
+        """
+        from_sq = move.from_square
+        to_sq = move.to_square
 
-    # ============================================================
-    # 2. SLIDING MOVES (8 directions × 7 distances = 56)
-    # ============================================================
-    move_dir = None
-    for i, (dx_dir, dy_dir) in enumerate(DIRECTIONS):
+        fx = chess.square_file(from_sq)
+        fy = chess.square_rank(from_sq)
+        tx = chess.square_file(to_sq)
+        ty = chess.square_rank(to_sq)
 
-        if dx_dir != 0 and (dx == 0 or dx % dx_dir != 0):
-            continue
-        if dy_dir != 0 and (dy == 0 or dy % dy_dir != 0):
-            continue
-        if dx_dir == 0 and dx != 0:
-            continue
-        if dy_dir == 0 and dy != 0:
-            continue
-
-        # Calculate number of squares moved
-        k = 0
-        if dx_dir != 0:
-            k = dx // dx_dir
-        elif dy_dir != 0:
-            k = dy // dy_dir
+        dx = tx - fx
+        dy = ty - fy
         
-        # Check if the other dimension matches
-        if k > 0 and (dx == k * dx_dir) and (dy == k * dy_dir):
-            move_dir = i * 7 + (k - 1)
-            break
+        # Base index for the 'from' square (0, 73, 146, ...)
+        base_idx = from_sq * 73
 
-    if move_dir is None:
-        # KNIGHT MOVES AND KINGS MOVES FALL HERE
-        # Training code: "Knight or illegal → encode as zero bucket"
-        return from_sq * 73   # bucket 0 for this from-square
+        # Case 1: Under-promotions (N, B, R)
+        if move.promotion in PROMO_PIECES:
+            plane = UNDER_PROMO_MAP.get((dx, move.promotion))
+            if plane is not None:
+                return base_idx + plane
 
-    return from_sq * 73 + move_dir
+        # Case 2: Knight moves
+        plane = KNIGHT_MAP.get((dy, dx))
+        if plane is not None:
+            return base_idx + plane
 
+        # Case 3: Queen-like moves (incl. King, Pawn, Rook, Bishop, Queen)
+        # This also handles Queen promotions (as 1-square pushes)
+        # and Castling (as 2-square king moves).
+        plane = QUEEN_MAP.get((dy, dx))
+        if plane is not None:
+            return base_idx + plane
+
+        # Should be unreachable for any legal move
+        # Fallback to the '0' bucket for this square
+        return base_idx
 # ============================================================================
 # POLICY MODEL
 # ============================================================================
@@ -332,49 +347,6 @@ class PolicyModel(nn.Module):
         # Sort by probability and take top N
         legal_moves.sort(key=lambda x: x[1], reverse=True)
         return legal_moves[:n]
-    
-    @torch.no_grad()
-    def get_top_n_moves(self, board: chess.Board, n: int = 10) -> List[Tuple[chess.Move, float]]:
-        """
-        Get top N legal moves from the policy model
-        
-        Args:
-            board: Current chess position
-            n: Number of candidate moves to return
-        
-        Returns:
-            List of (move, probability) tuples, sorted by probability
-        """
-        self.eval()
-        
-        # Encode board (17 channels)
-        board_tensor = PolicyBoardEncoder.encode_board(board).unsqueeze(0)
-
-        # Move encoded board to the same device as the model
-        device = next(self.parameters()).device
-        board_tensor = board_tensor.to(device)
-
-        # Get move logits
-        logits = self.forward(board_tensor).squeeze(0)
-        probs = F.softmax(logits, dim=0)
-        
-        # Get all legal moves with their probabilities
-        legal_moves = []
-        for move in board.legal_moves:
-            # Simple encoding: from_square * 64 + to_square
-            move_idx = move.from_square * 64 + move.to_square
-            if move_idx < len(probs):
-                legal_moves.append((move, probs[move_idx].item()))
-        
-        # If no moves matched (shouldn't happen), use uniform distribution
-        if not legal_moves:
-            legal_moves = [(move, 1.0 / len(list(board.legal_moves))) 
-                          for move in board.legal_moves]
-        
-        # Sort by probability and take top N
-        legal_moves.sort(key=lambda x: x[1], reverse=True)
-        return legal_moves[:n]
-
 
 # ============================================================================
 # VALUE MODEL (18 channels, 12 residual blocks, GroupNorm)
