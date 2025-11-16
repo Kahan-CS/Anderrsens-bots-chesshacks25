@@ -157,6 +157,86 @@ class ResidualBlockGN(nn.Module):
         return F.relu(out + identity)
 
 # ============================================================================
+# MOVE INDEXING LOGIC (FROM engine/move_index.py)
+# WARNING: This logic is flawed and does not handle Knight moves.
+# ============================================================================
+DIRECTIONS = [
+    (1, 0),  (-1, 0),  (0, 1),  (0, -1),
+    (1, 1),  (1, -1), (-1, 1), (-1, -1)
+]
+PROMO_ORDER = [chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
+
+def move_to_index(move: chess.Move, board: chess.Board) -> int:
+    """
+    EXACT AlphaZero-style 4672 indexing as used in your training data.
+    73 moves per from-square.
+
+    WARNING: This implementation is flawed. It maps all Knight moves
+    to the '0' bucket for their from_square.
+    """
+
+    from_sq = move.from_square
+    to_sq = move.to_square
+
+    fx = chess.square_file(from_sq)
+    fy = chess.square_rank(from_sq)
+    tx = chess.square_file(to_sq)
+    ty = chess.square_rank(to_sq)
+
+    dx = tx - fx
+    dy = ty - fy
+
+    # ============================================================
+    # 1. PROMOTIONS
+    # WARNING: Flawed - does not distinguish dx
+    # ============================================================
+    if move.promotion is not None:
+        try:
+            promo_type = PROMO_ORDER.index(move.promotion)  # 0..3
+        except ValueError:
+            return from_sq * 73 # Fallback for non-standard promo?
+
+        # Training used: 56 + (rank_diff * 7) + promo_type
+        # rank_diff = (ty - fy)
+        direction_idx = 56 + (ty - fy) * 7 + promo_type
+
+        return from_sq * 73 + direction_idx
+
+    # ============================================================
+    # 2. SLIDING MOVES (8 directions × 7 distances = 56)
+    # ============================================================
+    move_dir = None
+    for i, (dx_dir, dy_dir) in enumerate(DIRECTIONS):
+
+        if dx_dir != 0 and (dx == 0 or dx % dx_dir != 0):
+            continue
+        if dy_dir != 0 and (dy == 0 or dy % dy_dir != 0):
+            continue
+        if dx_dir == 0 and dx != 0:
+            continue
+        if dy_dir == 0 and dy != 0:
+            continue
+
+        # Calculate number of squares moved
+        k = 0
+        if dx_dir != 0:
+            k = dx // dx_dir
+        elif dy_dir != 0:
+            k = dy // dy_dir
+        
+        # Check if the other dimension matches
+        if k > 0 and (dx == k * dx_dir) and (dy == k * dy_dir):
+            move_dir = i * 7 + (k - 1)
+            break
+
+    if move_dir is None:
+        # KNIGHT MOVES AND KINGS MOVES FALL HERE
+        # Training code: "Knight or illegal → encode as zero bucket"
+        return from_sq * 73   # bucket 0 for this from-square
+
+    return from_sq * 73 + move_dir
+
+# ============================================================================
 # POLICY MODEL
 # ============================================================================
 class PolicyModel(nn.Module):
@@ -201,6 +281,57 @@ class PolicyModel(nn.Module):
         x = self.res_layers(x)
         x = self.policy_head(x)
         return x
+
+    @torch.no_grad()
+    def get_top_n_moves(self, board: chess.Board, n: int = 10) -> List[Tuple[chess.Move, float]]:
+        """
+        Get top N legal moves from the policy model
+        
+        Args:
+            board: Current chess position
+            n: Number of candidate moves to return
+        
+        Returns:
+            List of (move, probability) tuples, sorted by probability
+        """
+        self.eval()
+        
+        # Encode board (17 channels)
+        board_tensor = PolicyBoardEncoder.encode_board(board).unsqueeze(0)
+
+        # Move encoded board to the same device as the model
+        device = next(self.parameters()).device
+        board_tensor = board_tensor.to(device)
+
+        # Get move logits (shape [1, 4672])
+        logits = self.forward(board_tensor).squeeze(0)
+        probs = F.softmax(logits, dim=0)
+        
+        # Get all legal moves with their probabilities
+        legal_moves = []
+        for move in board.legal_moves:
+            
+            # ----------------------------------------------------------------
+            # CORRECTED LOGIC: Use the 4672-index mapping
+            # ----------------------------------------------------------------
+            move_idx = move_to_index(move, board) 
+            # ----------------------------------------------------------------
+
+            if 0 <= move_idx < len(probs):
+                legal_moves.append((move, probs[move_idx].item()))
+            else:
+                # This case should not be hit if move_to_index is correct
+                legal_moves.append((move, 0.0))
+        
+        # If no moves matched (e.g., if all moves are Knight moves
+        # and they all map to the same bad index), use uniform distribution
+        if not legal_moves or all(p == 0.0 for _, p in legal_moves):
+            num_legal = len(list(board.legal_moves))
+            return [(move, 1.0 / num_legal) for move in board.legal_moves][:n]
+        
+        # Sort by probability and take top N
+        legal_moves.sort(key=lambda x: x[1], reverse=True)
+        return legal_moves[:n]
     
     @torch.no_grad()
     def get_top_n_moves(self, board: chess.Board, n: int = 10) -> List[Tuple[chess.Move, float]]:
