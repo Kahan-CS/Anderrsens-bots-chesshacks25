@@ -135,6 +135,26 @@ class ResidualBlock(nn.Module):
         out = self.bn2(self.conv2(out))
         return F.relu(out + identity)
 
+# ============================================================================
+# GROUPNORM RESIDUAL BLOCK (for Value Model only)
+# ============================================================================
+class ResidualBlockGN(nn.Module):
+    """Residual block using GroupNorm (32 groups) for stability on large datasets."""
+
+    def __init__(self, channels=128, use_bias=True, num_groups=32):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=use_bias)
+        self.gn1 = nn.GroupNorm(num_groups=num_groups, num_channels=channels)
+
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=use_bias)
+        self.gn2 = nn.GroupNorm(num_groups=num_groups, num_channels=channels)
+
+    def forward(self, x):
+        identity = x
+        out = F.relu(self.gn1(self.conv1(x)))
+        out = self.gn2(self.conv2(out))
+        return F.relu(out + identity)
+
 
 # ============================================================================
 # POLICY MODEL
@@ -226,80 +246,58 @@ class PolicyModel(nn.Module):
 
 
 # ============================================================================
-# VALUE MODEL (18 channels, 12 residual blocks)
+# VALUE MODEL (18 channels, 12 residual blocks, GroupNorm + tanh)
 # ============================================================================
 class ValueModel(nn.Module):
     """
-    Neural network that evaluates board positions
-    Trained with 18 channels and Huber loss
+    Value network using GroupNorm (stable on huge datasets)
+    Trained to output values in [-1, 1], later scaled to centipawns.
     """
-    
+
     def __init__(self, channels=128, num_blocks=12):
         super().__init__()
-        
-        # Input convolution (18 channels)
-        self.conv_in = nn.Conv2d(18, channels, kernel_size=3, padding=1)
-        self.bn_in = nn.BatchNorm2d(channels)
-        
-        # Residual blocks
+
+        # Input conv
+        self.conv_in = nn.Conv2d(18, channels, kernel_size=3, padding=1, bias=True)
+        self.gn_in = nn.GroupNorm(num_groups=32, num_channels=channels)
+
+        # Residual tower using ResidualBlockGN
         self.blocks = nn.Sequential(
-            *[ResidualBlock(channels) for _ in range(num_blocks)]
+            *[ResidualBlockGN(channels, use_bias=True) for _ in range(num_blocks)]
         )
-        
+
         # Value head
-        self.conv_value = nn.Conv2d(channels, 8, kernel_size=1)
-        self.bn_value = nn.BatchNorm2d(8)
+        self.conv_value = nn.Conv2d(channels, 8, kernel_size=1, bias=True)
+        self.gn_value = nn.GroupNorm(num_groups=8, num_channels=8)
+
         self.fc_value1 = nn.Linear(8 * 8 * 8, 256)
         self.fc_value2 = nn.Linear(256, 1)
-        
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass
-        
-        Args:
-            x: Board tensor of shape (batch, 18, 8, 8)
-        
-        Returns:
-            Value evaluation of shape (batch, 1) in centipawns
-        """
-        x = F.relu(self.bn_in(self.conv_in(x)))
+        # Conv + GN + ReLU
+        x = F.relu(self.gn_in(self.conv_in(x)))
         x = self.blocks(x)
-        
+
         # Value head
-        v = F.relu(self.bn_value(self.conv_value(x)))
+        v = F.relu(self.gn_value(self.conv_value(x)))
         v = v.view(v.size(0), -1)
         v = F.relu(self.fc_value1(v))
         v = self.fc_value2(v)
-        
+
+        # Output MUST be in [-1, 1]
+        v = torch.tanh(v)
         return v
-    
+
     @torch.no_grad()
     def evaluate_position(self, board: chess.Board) -> float:
-        """
-        Evaluate a single board position
-        
-        Args:
-            board: Chess position to evaluate
-        
-        Returns:
-            Evaluation score in centipawns from current player's perspective
-        """
-        TARGET_SCALE = 2000.0  # must match training script
+        TARGET_SCALE = 2000.0  # same as training
         self.eval()
-        
-        # Encode board (18 channels)
-        board_tensor = ValueBoardEncoder.encode_board(board).unsqueeze(0)
-        
-        # Move encoded board to model device
-        device = next(self.parameters()).device
-        board_tensor = board_tensor.to(device)    
-            
-        # model returns scaled value in [-1,1]
-        v_scaled = self.forward(board_tensor).squeeze().item()
 
-        # convert to centipawns
+        x = ValueBoardEncoder.encode_board(board).unsqueeze(0)
+        x = x.to(next(self.parameters()).device)
+
+        v_scaled = self.forward(x).squeeze().item()
         return v_scaled * TARGET_SCALE
-
 
 # ============================================================================
 # MINIMAX SEARCH ENGINE
@@ -426,7 +424,7 @@ class ChessBot:
         print("[INFO] Downloading weights from HuggingFace Hub...")
 
         policy_path = hf_hub_download(repo_id=repo_id, filename="policy_resnet.pt")
-        value_path = hf_hub_download(repo_id=repo_id, filename="value_model_2.pth")
+        value_path = hf_hub_download(repo_id=repo_id, filename="value_model_3.pth")
 
         # Load state dicts
         self.policy_model.load_state_dict(
