@@ -1,6 +1,6 @@
 # engine/search.py
 import chess
-from Combined.move_index import move_to_index
+from src.move_index import move_to_index
 
 class SimpleSearch:
     def __init__(self, policy_fn, value_fn=None, top_moves_fn=None,
@@ -9,6 +9,8 @@ class SimpleSearch:
         self.value_fn = value_fn
         self.top_moves_fn = top_moves_fn
         self.depth = depth
+        # Add this line:
+        self.move_index_fn = move_to_index
 
     def pick_move(self, board: chess.Board):
         legal = list(board.legal_moves)

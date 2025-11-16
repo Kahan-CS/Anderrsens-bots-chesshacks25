@@ -1,7 +1,7 @@
 # engine/value_wrapper.py
 import torch
 import numpy as np
-from Value.value_model import ValueModel, BoardEncoder
+from src.value_model import ValueModel, BoardEncoder
 
 class ValueWrapper:
     def __init__(self, model, device="cpu"):

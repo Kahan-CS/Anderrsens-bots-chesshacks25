@@ -2,9 +2,9 @@
 
 import torch
 import os
-from Value.value_model import ValueModel
+from src.value_model import ValueModel
 
-VALUE_PATH = "/Users/devonrempel/PycharmProjects/ModelBasis/Value/value_model.pth"
+VALUE_PATH = "src/value_model.pth"
 
 def load_value_model(device="cpu"):
     """

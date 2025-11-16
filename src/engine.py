@@ -1,9 +1,8 @@
 # engine/engine.py
 import chess
-from Combined.policy_wrapper import PolicyWrapper
-from Combined.value_wrapper import ValueWrapper
-from Combined.search import SimpleSearch
-
+from src.policy_wrapper import PolicyWrapper
+from src.value_wrapper import ValueWrapper
+from src.search import SimpleSearch
 class CombinedEngine:
     def __init__(self, policy_model, value_model=None, device="cpu"):
 

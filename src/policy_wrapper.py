@@ -2,8 +2,8 @@
 import torch
 import chess
 import numpy as np
-from Combined.board_encoder import board_to_tensor
-from Combined.move_index import move_to_index
+from src.board_encoder import board_to_tensor
+from src.move_index import move_to_index
 
 class PolicyWrapper:
     def __init__(self, model, device="cpu"):

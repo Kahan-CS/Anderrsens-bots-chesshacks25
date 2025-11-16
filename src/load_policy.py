@@ -1,10 +1,10 @@
 # Combined/load_policy.py
 
 import torch
-from policy_model import PolicyNetRes
+from src.policy_model import PolicyNetRes
 import os
 
-POLICY_PATH = "/Users/devonrempel/PycharmProjects/ModelBasis/policy_resnet.pt"
+POLICY_PATH = "src/policy_resnet.pt"
 
 def load_policy_model(device="cpu"):
     """
