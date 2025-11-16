@@ -25,4 +25,4 @@ class CombinedEngine:
         )
 
     def choose_move(self, board):
-        return self.searcher.pick_move(board, time_limit=8, max_depth=3)
+        return self.searcher.pick_move(board, time_limit=2, max_depth=3)
