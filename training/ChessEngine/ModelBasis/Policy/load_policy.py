@@ -1,0 +1,23 @@
+# Combined/load_policy.py
+
+import torch
+from policy_model import PolicyNetRes
+import os
+
+POLICY_PATH = "/Users/devonrempel/PycharmProjects/ModelBasis/policy_resnet.pt"
+
+def load_policy_model(device="cpu"):
+    """
+    Loads your trained policy network from disk.
+    """
+
+    if not os.path.exists(POLICY_PATH):
+        raise FileNotFoundError(f"Policy model not found at {POLICY_PATH}")
+
+    model = PolicyNetRes()
+    state = torch.load(POLICY_PATH, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+
+    print("[PolicyModel] Loaded successfully.")
+    return model.to(device)
