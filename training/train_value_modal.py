@@ -1,45 +1,12 @@
+# train_value_modal.py
 """
-Value Model Training on Modal (Serverless GPU) - v3.0
+Value Model Training on Modal (Serverless GPU) - cleaned & dataset-tuned.
 
-IMPROVEMENTS:
-- ✅ Huber loss (robust to extreme mate scores)
-- ✅ Clipped evaluations (±5000 cp max)
-- ✅ Weight decay regularization
-- ✅ 18-channel input (proper castling encoding)
-
-Trains chess value model on Modal's cloud GPUs with:
-- Automatic checkpoint saving/resuming
-- Progress tracking (samples trained)
-- Cost-efficient GPU selection
-- Remote training with local results
-
-Setup:
-    1. pip install modal
-    2. modal setup (authenticate)
-    3. Run: modal run train_value_modal.py::main
-
-Usage Examples:
-    # Test run (5 min, ~$0.10)
-    modal run train_value_modal.py::main --epochs 2 --max-samples 10000
-
-    # Recommended: Large dataset, few epochs
-    modal run train_value_modal.py::main --epochs 5 --max-samples 2000000
-
-    # Resume training
-    modal run train_value_modal.py::main --resume --epochs 20
-
-    # Download trained model
-    modal run train_value_modal.py::download
-
-    # List all saved models
-    modal run train_value_modal.py::list_models
-
-Cost with A10G GPU (~$1.10/hr):
-    - 10k samples, 2 epochs: ~5 min = $0.10
-    - 100k samples, 10 epochs: ~1 hr = $1.10
-    - 2M samples, 5 epochs: ~10 hr = $11
-
-Note: No .env file or secrets needed - Modal handles authentication automatically
+Key changes:
+- Clip evaluations to ±2000 cp
+- Normalize targets to [-1, +1] by dividing by CLIP (TARGET_SCALE)
+- Use HuberLoss(delta=0.2) in scaled domain
+- Report MAE in centipawns for readability
 """
 
 import modal
@@ -112,8 +79,15 @@ def train_on_modal(
     import sys
     
     print("=" * 70)
-    print("CHESS VALUE MODEL TRAINING ON MODAL")
+    print("CHESS VALUE MODEL TRAINING ON MODAL (PATCHED FOR DATASET)")
     print("=" * 70)
+
+    # -------------------------
+    # Important: clipping + scaling
+    # -------------------------
+    # We clip to ±CLIP centipawns, then scale by TARGET_SCALE=CLIP to map to [-1, +1].
+    CLIP = 2000.0
+    TARGET_SCALE = CLIP  # divide raw cp by TARGET_SCALE to get model target in [-1,1]
     
     # Verify GPU availability
     if torch.cuda.is_available():
@@ -130,12 +104,11 @@ def train_on_modal(
     print("=" * 70)
     
     # ========================================================================
-    # BOARD ENCODING (Fixed: 18 channels for proper castling encoding)
+    # BOARD ENCODING (18 channels)
     # ========================================================================
     class BoardEncoder:
         @staticmethod
         def encode_board(board):
-            # Fixed: Use 18 channels to properly encode all castling rights
             planes = torch.zeros(18, 8, 8, dtype=torch.float32)
             
             piece_idx = {
@@ -208,12 +181,11 @@ def train_on_modal(
             return v
     
     # ========================================================================
-    # DATASET
+    # DATASET (clip to CLIP and scale by TARGET_SCALE)
     # ========================================================================
     class ChessEvaluationDataset(Dataset):
         def __init__(self, split='train', max_samples=None):
             print(f"\nLoading dataset (split={split})...")
-            
             try:
                 dataset = load_dataset(
                     "ssingh22/chess-evaluations",
@@ -221,9 +193,9 @@ def train_on_modal(
                     split="train",
                     streaming=False
                 )
-                print(f"✓ Dataset loaded: {len(dataset):,} total positions")
+                print(f"[]Dataset loaded: {len(dataset):,} total positions")
             except Exception as e:
-                print(f"✗ Error loading dataset: {e}")
+                print(f"[ERR]Error loading dataset: {e}")
                 raise
             
             # Train/test split (90/10)
@@ -237,8 +209,8 @@ def train_on_modal(
                 dataset = dataset.select(range(max_samples))
             
             self.data = dataset
-            print(f"✓ Using {len(self.data):,} positions for {split}")
-        
+            print(f"[]Using {len(self.data):,} positions for {split}")
+
         def __len__(self):
             return len(self.data)
         
@@ -253,28 +225,26 @@ def train_on_modal(
                 return torch.zeros(18, 8, 8), torch.tensor(0.0)
             
             eval_cp = self._parse_evaluation(eval_str, board.turn)
+
+            # Clip and scale target BEFORE returning
+            eval_cp = max(-CLIP, min(CLIP, eval_cp))
+            scaled_target = eval_cp / TARGET_SCALE  # scaled target in [-1,1]
+
             board_tensor = BoardEncoder.encode_board(board)
-            
-            return board_tensor, torch.tensor(eval_cp, dtype=torch.float32)
-        
+            return board_tensor, torch.tensor(scaled_target, dtype=torch.float32)
+
         def _parse_evaluation(self, eval_str, turn):
-            eval_str = eval_str.strip()
-            
-            if '#' in eval_str:
-                # Mate score - clip to reasonable range to prevent extreme values
-                mate_in = int(eval_str.replace('#', '').replace('+', '').replace('-', ''))
-                # Clip mate scores to ±5000 (50 pawns) to reduce skew
-                # Still clearly winning, but not so large it dominates loss
-                mate_score = min(5000 - abs(mate_in) * 10, 5000)
-                if '+' in eval_str or (eval_str.startswith('#') and '-' not in eval_str):
-                    eval_white = mate_score
-                else:
-                    eval_white = -mate_score
+            s = str(eval_str).strip()
+            if '#' in s:
+                # Mate present, treat as strong win/loss and clip later
+                sign = -1 if '-' in s else 1
+                eval_white = sign * CLIP
             else:
+                # handle formats like '+12.34', '12.34', '-123', etc.
                 try:
-                    eval_white = float(eval_str)
-                    # Also clip extreme non-mate evaluations (rare but possible)
-                    eval_white = max(-5000, min(5000, eval_white))
+                    # remove any stray plus signs
+                    cleaned = s.replace('+', '')
+                    eval_white = float(cleaned)
                 except Exception:
                     eval_white = 0.0
             
@@ -293,7 +263,7 @@ def train_on_modal(
             'metrics': metrics,
         }
         torch.save(checkpoint, path)
-        print(f"✓ Checkpoint saved: {path.name}")
+        print(f"[]Checkpoint saved: {path.name}")
     
     def load_checkpoint(model, optimizer, path):
         """Load training checkpoint if exists"""
@@ -306,10 +276,10 @@ def train_on_modal(
                 epoch = checkpoint['epoch']
                 samples = checkpoint['samples_trained']
                 metrics = checkpoint['metrics']
-                print(f"✓ Resumed from epoch {epoch}, {samples:,} samples trained")
+                print(f"[]Resumed from epoch {epoch}, {samples:,} samples trained")
                 return epoch, samples, metrics
             except Exception as e:
-                print(f"✗ Error loading checkpoint: {e}")
+                print(f"[ERR]Error loading checkpoint: {e}")
                 print("Starting fresh training...")
         
         return 0, 0, {'train_losses': [], 'test_losses': [], 'best_test_loss': float('inf')}
@@ -319,78 +289,94 @@ def train_on_modal(
     # ========================================================================
     def train_epoch(model, dataloader, optimizer, criterion, device, epoch, start_samples):
         model.train()
-        total_loss = 0
+        total_loss = 0.0
         num_batches = 0
         samples_processed = 0
-        
+        total_mae_cp = 0.0
+
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}", file=sys.stdout)
         
         for board_tensors, eval_targets in progress_bar:
             try:
                 board_tensors = board_tensors.to(device)
-                eval_targets = eval_targets.to(device).unsqueeze(1)
-                
+                eval_targets = eval_targets.to(device).unsqueeze(1)  # scaled targets
+
                 optimizer.zero_grad()
-                predictions = model(board_tensors)
+                predictions = model(board_tensors)  # scaled predictions
                 loss = criterion(predictions, eval_targets)
-                
-                # Check for NaN
+
                 if torch.isnan(loss):
-                    print("⚠ NaN loss detected, skipping batch")
+                    print("[WARN] NaN loss detected, skipping batch")
                     continue
-                
+
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-                
+
+                # Compute MAE in centipawns for monitoring
+                preds_cp = (predictions * TARGET_SCALE).detach()
+                targets_cp = (eval_targets * TARGET_SCALE).detach()
+                batch_mae_cp = torch.mean(torch.abs(preds_cp - targets_cp)).item()
+
                 total_loss += loss.item()
+                total_mae_cp += batch_mae_cp
                 num_batches += 1
-                samples_processed += len(board_tensors)
-                
+                samples_processed += board_tensors.size(0)
+
                 progress_bar.set_postfix({
-                    'loss': f"{total_loss / num_batches:.2f}",
-                    'total_samples': f"{start_samples + samples_processed:,}"
+                    'huber_scaled': f"{total_loss / num_batches:.4f}",
+                    'mae_cp': f"{total_mae_cp / num_batches:.1f}",
+                    'samples': f"{start_samples + samples_processed:,}"
                 })
             except RuntimeError as e:
                 if "out of memory" in str(e):
-                    print(f"\n⚠ OOM Error! Try reducing batch size.")
+                    print(f"\n[WARN] OOM Error! Try reducing batch size.")
                     torch.cuda.empty_cache()
                     raise
                 else:
                     raise
-        
-        return total_loss / max(num_batches, 1), samples_processed
-    
+
+        avg_loss = total_loss / max(num_batches, 1)
+        avg_mae_cp = total_mae_cp / max(num_batches, 1)
+        return avg_loss, avg_mae_cp, samples_processed
+
     def evaluate(model, dataloader, criterion, device):
         model.eval()
-        total_loss = 0
+        total_loss = 0.0
+        total_mae_cp = 0.0
         num_batches = 0
-        
+
         with torch.no_grad():
             for board_tensors, eval_targets in tqdm(dataloader, desc="Evaluating", file=sys.stdout):
                 board_tensors = board_tensors.to(device)
                 eval_targets = eval_targets.to(device).unsqueeze(1)
                 predictions = model(board_tensors)
                 loss = criterion(predictions, eval_targets)
+
+                preds_cp = predictions * TARGET_SCALE
+                targets_cp = eval_targets * TARGET_SCALE
+                batch_mae_cp = torch.mean(torch.abs(preds_cp - targets_cp)).item()
+
                 total_loss += loss.item()
+                total_mae_cp += batch_mae_cp
                 num_batches += 1
-        
-        return total_loss / max(num_batches, 1)
-    
+
+        avg_loss = total_loss / max(num_batches, 1)
+        avg_mae_cp = total_mae_cp / max(num_batches, 1)
+        return avg_loss, avg_mae_cp
+
     # ========================================================================
-    # MAIN TRAINING LOOP
+    # MAIN TRAINING LOOP (scaled targets)
     # ========================================================================
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Load datasets
+
     try:
         train_dataset = ChessEvaluationDataset(split='train', max_samples=max_samples)
         test_dataset = ChessEvaluationDataset(split='test', max_samples=min(10000, max_samples // 10))
     except Exception as e:
-        print(f"\n✗ Failed to load dataset: {e}")
+        print(f"\n[ERR]Failed to load dataset: {e}")
         raise
-    
-    # Create dataloaders
+
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
         num_workers=4, pin_memory=True, drop_last=True
@@ -399,135 +385,115 @@ def train_on_modal(
         test_dataset, batch_size=batch_size, shuffle=False,
         num_workers=4, pin_memory=True, drop_last=False
     )
-    
-    # Initialize model
+
     print(f"\nInitializing model (channels={channels}, blocks={num_blocks})...")
     model = ValueModel(channels=channels, num_blocks=num_blocks).to(device)
-    print(f"✓ Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
-    # Use Huber loss instead of MSE - better for chess with extreme mate scores
-    # Delta=100 means errors below 100cp are treated as L2, above as L1
-    criterion = nn.HuberLoss(delta=100.0)
-    print(f"✓ Using Huber loss (delta=100 cp) - robust to mate score outliers")
-    
+    print(f"[]Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # Use Huber loss in scaled domain (delta=0.2 corresponds to 400 cp)
+    criterion = nn.HuberLoss(delta=0.2)
+    print(f"[]Using Huber loss (delta=0.2 in scaled units -> {int(0.2 * TARGET_SCALE)} cp)")
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    print(f"✓ Adam optimizer with weight decay (prevents overfitting)")
-    
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=2, verbose=True
     )
-    
-    # Setup checkpoint paths
+
     checkpoint_dir = Path(VOLUME_PATH) / "checkpoints"
     checkpoint_dir.mkdir(exist_ok=True, parents=True)
     checkpoint_file = checkpoint_dir / "value_model_checkpoint.pt"
-    
-    # Load checkpoint if resuming
+
     if resume:
-        start_epoch, samples_trained, metrics = load_checkpoint(
-            model, optimizer, checkpoint_file
-        )
+        start_epoch, samples_trained, metrics = load_checkpoint(model, optimizer, checkpoint_file)
     else:
-        start_epoch, samples_trained, metrics = 0, 0, {
-            'train_losses': [], 'test_losses': [], 'best_test_loss': float('inf')
-        }
-    
-    # Training loop
+        start_epoch, samples_trained, metrics = 0, 0, {'train_losses': [], 'test_losses': [], 'best_test_loss': float('inf')}
+
     print("\n" + "=" * 70)
-    print("TRAINING")
+    print("TRAINING (scaled targets)")
     print("=" * 70)
-    
+
     for epoch in range(start_epoch, epochs):
-        print(f"\n📊 Epoch {epoch + 1}/{epochs}")
+        print(f"\n Epoch {epoch + 1}/{epochs}")
         print("-" * 70)
-        
-        # Train
+
         try:
-            train_loss, epoch_samples = train_epoch(
+            train_loss, train_mae_cp, epoch_samples = train_epoch(
                 model, train_loader, optimizer, criterion, device, epoch + 1, samples_trained
             )
             samples_trained += epoch_samples
             metrics['train_losses'].append(train_loss)
-            print(f"✓ Train Loss: {train_loss:.2f} (Huber)")
-            print(f"✓ Total samples trained: {samples_trained:,}")
+            print(f"[]Train Loss (scaled Huber): {train_loss:.4f}")
+            print(f"[]Train MAE: {train_mae_cp:.1f} centipawns")
         except Exception as e:
-            print(f"✗ Training error: {e}")
+            print(f"[ERR]Training error: {e}")
             raise
-        
-        # Evaluate
+
         try:
-            test_loss = evaluate(model, test_loader, criterion, device)
+            test_loss, test_mae_cp = evaluate(model, test_loader, criterion, device)
             metrics['test_losses'].append(test_loss)
-            print(f"✓ Test Loss: {test_loss:.2f} (Huber)")
+            print(f"[]Test Loss (scaled Huber): {test_loss:.4f}")
+            print(f"[]Test MAE: {test_mae_cp:.1f} centipawns")
         except Exception as e:
-            print(f"✗ Evaluation error: {e}")
+            print(f"[ERR]Evaluation error: {e}")
             raise
-        
-        # Learning rate scheduling
+
         scheduler.step(test_loss)
-        
-        # Save checkpoint every epoch
-        save_checkpoint(
-            model, optimizer, epoch + 1, samples_trained, metrics, checkpoint_file
-        )
-        
-        # Save best model
+
+        save_checkpoint(model, optimizer, epoch + 1, samples_trained, metrics, checkpoint_file)
+
         if test_loss < metrics['best_test_loss']:
             metrics['best_test_loss'] = test_loss
             best_model_path = checkpoint_dir / "value_model_best.pth"
             torch.save(model.state_dict(), best_model_path)
-            print(f"🏆 New best model! Test loss: {test_loss:.2f} (Huber)")
-        
-        # Commit volume changes
+            print(f" New best model! Test loss: {test_loss:.4f} (scaled)")
+
         volume.commit()
-    
-    # ========================================================================
-    # SAVE FINAL MODEL
-    # ========================================================================
+
+    # Save final model (state_dict)
     final_model_path = checkpoint_dir / "value_model_final.pth"
     torch.save(model.state_dict(), final_model_path)
-    
-    # Save training summary
+
+    # Save training summary (report MAE in cp for readability)
     summary = {
         'total_samples_trained': samples_trained,
         'total_epochs': epochs,
-        'best_test_loss': metrics['best_test_loss'],
-        'final_train_loss': metrics['train_losses'][-1] if metrics['train_losses'] else 0,
-        'final_test_loss': metrics['test_losses'][-1] if metrics['test_losses'] else 0,
+        'best_test_loss_scaled': metrics['best_test_loss'],
+        'final_train_loss_scaled': metrics['train_losses'][-1] if metrics['train_losses'] else 0,
+        'final_test_loss_scaled': metrics['test_losses'][-1] if metrics['test_losses'] else 0,
         'architecture': {
             'channels': channels,
             'num_blocks': num_blocks,
-        }
+        },
+        'clip_cp': CLIP,
+        'target_scale': TARGET_SCALE
     }
-    
+
     summary_path = checkpoint_dir / "training_summary.json"
     with open(summary_path, 'w') as f:
         json.dump(summary, f, indent=2)
-    
+
     volume.commit()
-    
+
     print("\n" + "=" * 70)
-    print("✅ TRAINING COMPLETE")
+    print("TRAINING COMPLETE")
     print("=" * 70)
-    print(f"📊 Total samples trained: {samples_trained:,}")
-    print(f"🏆 Best test loss: {metrics['best_test_loss']:.2f} (Huber)")
-    print(f"💾 Best model: {best_model_path.name}")
-    print(f"💾 Final model: {final_model_path.name}")
-    print(f"📄 Summary: {summary_path.name}")
+    print(f" Total samples trained: {samples_trained:,}")
+    print(f" Best model: {best_model_path.name}")
+    print(f" Final model: {final_model_path.name}")
+    print(f" Summary: {summary_path.name}")
     print("=" * 70)
-    
+
     return summary
 
 
-# ============================================================================
-# LOCAL ENTRYPOINT
-# ============================================================================
-
+# =============================================================================
+# Local entrypoint (unchanged)
+# =============================================================================
 @app.local_entrypoint()
 def main(
-    epochs: int = 10,
+    epochs: int = 5,
     batch_size: int = 256,
-    lr: float = 0.001,
+    lr: float = 3e-4,
     max_samples: int = 100000,
     channels: int = 128,
     num_blocks: int = 12,
@@ -550,16 +516,13 @@ def main(
         num_blocks: Number of residual blocks
         resume: Resume from checkpoint
     """
-    print("\n🚀 Starting training on Modal GPU...")
-    print(f"Configuration:")
-    print(f"  • Epochs: {epochs}")
-    print(f"  • Batch size: {batch_size}")
-    print(f"  • Max samples: {max_samples:,}")
-    print(f"  • Learning rate: {lr}")
-    print(f"  • Resume: {resume}")
+    print("\n Starting training on Modal GPU (patched script)...")
+    print(f"- Epochs: {epochs}")
+    print(f"- Batch size: {batch_size}")
+    print(f"- Max samples: {max_samples:,}")
+    print(f"- Learning rate: {lr}")
+    print(f"- Resume: {resume}")
     print()
-    
-    # Run training on Modal
     summary = train_on_modal.remote(
         epochs=epochs,
         batch_size=batch_size,
@@ -570,13 +533,13 @@ def main(
         resume=resume,
     )
     
-    print("\n✅ Training complete!")
-    print("\n📊 Training Summary:")
-    print(f"  • Samples trained: {summary['total_samples_trained']:,}")
-    print(f"  • Best test loss: {summary['best_test_loss']:.2f} (Huber)")
-    print(f"  • Final test loss: {summary['final_test_loss']:.2f} (Huber)")
-    print("\n📦 Models saved to Modal volume 'chess-models'")
-    print("\n📥 To download trained model:")
+    print("\n Training complete!")
+    print("\n Training Summary:")
+    print(f"- Samples trained: {summary['total_samples_trained']:,}")
+    print(f"- Best test loss: {summary['best_test_loss']:.2f} (Huber)")
+    print(f"- Final test loss: {summary['final_test_loss']:.2f} (Huber)")
+    print("\n Models saved to Modal volume 'chess-models'")
+    print("\n To download trained model:")
     print("  modal run train_value_modal.py::download")
 
 

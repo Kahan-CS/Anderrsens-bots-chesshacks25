@@ -284,6 +284,7 @@ class ValueModel(nn.Module):
         Returns:
             Evaluation score in centipawns from current player's perspective
         """
+        TARGET_SCALE = 2000.0  # must match training script
         self.eval()
         
         # Encode board (18 channels)
@@ -293,10 +294,11 @@ class ValueModel(nn.Module):
         device = next(self.parameters()).device
         board_tensor = board_tensor.to(device)    
             
-        # Get evaluation (already from current player's perspective)
-        eval_cp = self.forward(board_tensor).squeeze().item()
-        
-        return eval_cp
+        # model returns scaled value in [-1,1]
+        v_scaled = self.forward(board_tensor).squeeze().item()
+
+        # convert to centipawns
+        return v_scaled * TARGET_SCALE
 
 
 # ============================================================================
@@ -424,7 +426,7 @@ class ChessBot:
         print("[INFO] Downloading weights from HuggingFace Hub...")
 
         policy_path = hf_hub_download(repo_id=repo_id, filename="policy_resnet.pt")
-        value_path = hf_hub_download(repo_id=repo_id, filename="value_model.pth")
+        value_path = hf_hub_download(repo_id=repo_id, filename="value_model_2.pth")
 
         # Load state dicts
         self.policy_model.load_state_dict(
