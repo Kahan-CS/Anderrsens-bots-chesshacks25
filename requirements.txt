@@ -18,7 +18,7 @@ uvicorn==0.38.0
 
 # NEW LIST:
 # ML dependencies (for inference)
-torch==2.5.1
+torch==2.9.1
 numpy<2.0
 
 # Training dependencies (optional, only if training locally)
