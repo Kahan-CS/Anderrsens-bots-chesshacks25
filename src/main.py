@@ -484,14 +484,19 @@ class MinimaxSearch:
         """Recursive minimax with alpha-beta pruning"""
         self.nodes_searched += 1
         
-        # Base case
-        if depth == 0 or board.is_game_over():
+        self.MATE_SCORE = 100000 # Class constant (or define in __init__)
+
+        # Base case: Terminal node
+        if board.is_game_over():
             if board.is_checkmate():
-                return -10000  # Loss
-            elif board.is_stalemate() or board.is_insufficient_material():
-                return 0  # Draw
+                # Return mate score, preferring faster mates
+                return -(self.MATE_SCORE + depth)
             else:
-                return self.value_model.evaluate_position(board)
+                return 0 # Stalemate, draw
+
+        # Base case: Depth limit reached, start Quiescence Search
+        if depth == 0:
+            return self._qsearch(board, alpha, beta)
         
         # Get candidate moves
         n_moves = max(5, top_n - (3 - depth))
@@ -518,6 +523,54 @@ class MinimaxSearch:
         
         return max_eval
 
+    def _qsearch(self, board: chess.Board, alpha: float, beta: float, q_depth: int = 2) -> float:
+            """
+            Quiescence search to stabilize the position, focusing on captures.
+            q_depth limits runaway capture chains.
+            """
+            self.nodes_searched += 1
+
+            # 'Stand-pat' score: the evaluation if we do nothing
+            stand_pat_score = self.value_model.evaluate_position(board)
+
+            # Fail-high: If the stand-pat score is already better than beta,
+            # the opponent will avoid this line.
+            if stand_pat_score >= beta:
+                return beta
+            
+            # Update alpha with the best-case (stand-pat)
+            alpha = max(alpha, stand_pat_score)
+
+            # Stop if we hit q_depth or a terminal node
+            if q_depth == 0 or board.is_game_over():
+                return alpha
+
+            # --- Get and order capture moves ---
+            # Use the policy model to find capture candidates
+            candidates = self.policy_model.get_top_n_moves(board, n=15)
+            
+            # Filter for captures only, sorted by policy probability
+            capture_moves = []
+            for move, prob in candidates:
+                if board.is_capture(move):
+                    capture_moves.append(move)
+            
+            # If no captures, return the stand-pat score
+            if not capture_moves:
+                return alpha
+
+            for move in capture_moves:
+                board.push(move)
+                # Recurse with q_depth - 1
+                score = -self._qsearch(board, -beta, -alpha, q_depth - 1)
+                board.pop()
+
+                if score >= beta:
+                    return beta # Prune
+                
+                alpha = max(alpha, score)
+
+            return alpha
 
 # ============================================================================
 # MAIN CHESS BOT
