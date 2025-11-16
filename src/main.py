@@ -34,27 +34,31 @@ def get_move(ctx: GameContext) -> Move:
         raise ValueError("No legal moves available.")
 
     try:
-        # Engine chooses move
+        # Engine makes move
         move = engine.choose_move(board)
 
-        # Get policy probabilities
+        # Get raw policy probabilities
         probs = engine.policy.get_policy(board)
+
+        from src.move_index import move_to_index
+        
+        # MUST use Move keys, not strings
         legal_dict = {}
 
         for mv in legal_moves:
-            idx = move_to_index(mv, board)    # <-- FIXED
-            legal_dict[str(mv)] = float(probs[idx])
+            idx = move_to_index(mv, board)
+            legal_dict[mv] = float(probs[idx])
 
-        # Log to UI
         ctx.logProbabilities(legal_dict)
 
-        print(move)
+        print("Engine move:", move)
         return move
 
     except Exception as e:
         print("[ERROR] Engine failure:", e)
         ctx.logProbabilities({})
         return legal_moves[0]
+
 
 
 @chess_manager.reset

@@ -37,7 +37,7 @@ class SimpleSearch:
         best_move = None
         best_score = -9999
 
-        for mv, prior in scored[:12]:   # top 12 moves
+        for mv, prior in scored[:5]:   # top 12 moves
             board.push(mv)
             score = -self.search(board, self.depth - 1)
             board.pop()
